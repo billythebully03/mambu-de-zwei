@@ -4,6 +4,7 @@ import os
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.types import Message, User
+from aiogram.exceptions import TelegramAPIError
 
 from mambu import MembuCore
 
@@ -12,7 +13,7 @@ TOKEN = os.getenv("TOKEN")
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
 router = Router()
@@ -31,36 +32,36 @@ async def handle_message(message: Message):
 
     decision = membu.process(message, bot_user)
 
-    username = (
-        message.from_user.username
-        or message.from_user.first_name
-        if message.from_user
-        else "Unknown"
-    )
-
     logging.info(
-        "MEMBU | chat=%s | user=%s | action=%s | score=%s | reason=%s",
+        "MEMBU | chat=%s | action=%s | score=%s | reason=%s",
         message.chat.id,
-        username,
         decision.action,
         decision.score,
         decision.reason,
     )
 
-    icons = {
-        "reply": "🟢",
-        "wait": "🟡",
-        "ignore": "⚫",
+    descriptions = {
+        "SEND": "🟢 SEND — запрос Мишке",
+        "DEFER": "🟡 DEFER — накопление контекста",
+        "SKIP": "⚫ SKIP — пропуск",
     }
 
     diagnostic = (
-        f"{icons[decision.action]} MEMBU DECISION\n\n"
-        f"Действие: {decision.action.upper()}\n"
+        f"{descriptions[decision.action]}\n"
         f"Оценка: {decision.score}\n"
-        f"Причина: {decision.reason}"
+        f"Причина: {decision.reason}\n"
+        f"Сообщений в контексте: {len(decision.context)}"
     )
 
-    await message.answer(diagnostic)
+    # Пока только тестируем вычисления.
+    # Реального запроса к Мишке ещё нет.
+    try:
+        await message.reply(diagnostic)
+    except TelegramAPIError:
+        logging.exception(
+            "Could not send diagnostic to chat %s",
+            message.chat.id,
+        )
 
 
 async def main():
@@ -75,7 +76,10 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
-    logging.info("Membu started as @%s", bot_user.username)
+    logging.info(
+        "Membu started as @%s",
+        bot_user.username,
+    )
 
     await bot.delete_webhook(drop_pending_updates=True)
 
