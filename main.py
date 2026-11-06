@@ -26,34 +26,41 @@ async def handle_message(message: Message):
     if bot_user is None:
         return
 
+    if message.from_user and message.from_user.is_bot:
+        return
+
     decision = membu.process(message, bot_user)
+
+    username = (
+        message.from_user.username
+        or message.from_user.first_name
+        if message.from_user
+        else "Unknown"
+    )
 
     logging.info(
         "MEMBU | chat=%s | user=%s | action=%s | score=%s | reason=%s",
         message.chat.id,
-        message.from_user.id if message.from_user else None,
+        username,
         decision.action,
         decision.score,
         decision.reason,
     )
 
-    # В личке показываем результат принятия решения
-    if message.chat.type == "private":
-        await message.answer(
-            f"{decision.description}\n\n"
-            f"Действие: {decision.action}\n"
-            f"Оценка: {decision.score}\n"
-            f"Причина: {decision.reason}"
-        )
-        return
+    icons = {
+        "reply": "🟢",
+        "wait": "🟡",
+        "ignore": "⚫",
+    }
 
-    # В группе пока только имитируем решение.
-    # Реального ответа от Мембу на этом этапе нет.
-    if decision.action == "reply":
-        logging.info(
-            "MEMBU WOULD REPLY | chat=%s",
-            message.chat.id,
-        )
+    diagnostic = (
+        f"{icons[decision.action]} MEMBU DECISION\n\n"
+        f"Действие: {decision.action.upper()}\n"
+        f"Оценка: {decision.score}\n"
+        f"Причина: {decision.reason}"
+    )
+
+    await message.answer(diagnostic)
 
 
 async def main():
