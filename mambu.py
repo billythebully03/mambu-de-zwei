@@ -1,493 +1,373 @@
 import asyncio
-import logging
 import random
 import re
 import time
 
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Awaitable, Callable
 
 from aiogram.types import Message, User
 
 
-logger = logging.getLogger("membu.core")
-
-
 @dataclass
 class MessageRecord:
-    message_id: int
     user_id: int
-    name: str
+    username: str
     text: str
     timestamp: float
-    mentioned: bool
-    replied_to: bool
+    message_id: int
+    is_question: bool
+    is_mentioned: bool
+    is_reply_to_bot: bool
+    has_media: bool
 
 
 @dataclass
 class Decision:
     action: str
     reason: str
-    score: float
-    target_message_id: int
+    accepted: bool
     description: str
+    score: float = 0.0
+    details: list[str] = field(default_factory=list)
 
 
 class MembuCore:
+    def __init__(
+        self,
+        reporter: Callable[[int, Decision, int], Awaitable[None]],
+        batch_delay: float = 3.5,
+    ):
+        self.reporter = reporter
+        self.batch_delay = batch_delay
 
-    def __init__(self):
+        self.pending = defaultdict(list)
+        self.workers = {}
 
         self.history = defaultdict(
             lambda: deque(maxlen=40)
         )
 
-        self.pending = defaultdict(list)
-        self.tasks = {}
+        self.last_reply_time = defaultdict(float)
+        self.last_activity_time = defaultdict(float)
 
-        self.last_reply = defaultdict(float)
+        self.running = True
 
-        # Время сбора сообщений
-        self.debounce = 3.5
-
-        # Минимальный интервал между гипотетическими ответами
-        self.cooldown = 45.0
-
-        # Контекст для оценки социальной ситуации
-        self.context_window = 25.0
-
-        # Вероятностная вариативность
-        self.randomness = 0.45
-
-        self.short_reactions = {
-            "ок", "окей", "ага", "угу", "да",
-            "нет", "ясно", "понятно", "хах",
-            "ахах", "лол", "кек", "спс",
-            "спасибо", "👍", "👌", "😂"
-        }
-
-        logger.info("Membu Core initialized")
-
-    # -----------------------------------------
-    # ПОЛУЧЕНИЕ СООБЩЕНИЙ
-    # -----------------------------------------
-
-    async def submit(
-        self,
-        message: Message,
-        bot_user: User,
-        reporter
-    ):
-
-        user = message.from_user
-
-        if not user or user.is_bot:
+    async def submit(self, message: Message, bot_user: User):
+        if not self.running:
             return
 
-        text = (
-            message.text
-            or message.caption
-            or "[медиа]"
-        ).strip()
+        if message.from_user is None:
+            return
 
-        record = MessageRecord(
-            message_id=message.message_id,
-            user_id=user.id,
-            name=user.full_name,
-            text=text[:1500],
-            timestamp=time.time(),
-            mentioned=self.is_mentioned(
-                message,
-                bot_user
-            ),
-            replied_to=self.is_reply_to_bot(
-                message,
-                bot_user
-            )
-        )
+        if message.from_user.is_bot:
+            return
+
+        record = self.create_record(message, bot_user)
 
         chat_id = message.chat.id
 
-        self.history[chat_id].append(record)
         self.pending[chat_id].append(record)
+        self.history[chat_id].append(record)
 
-        logger.info(
-            "MESSAGE | chat=%s | user=%s | text=%s",
-            chat_id,
-            user.full_name,
-            text[:100]
-        )
+        self.last_activity_time[chat_id] = time.monotonic()
 
-        # Один сборщик на чат.
-        # Новые сообщения не перезапускают таймер.
-
-        if chat_id not in self.tasks:
-            self.tasks[chat_id] = asyncio.create_task(
-                self.worker(
-                    chat_id,
-                    message.chat.type,
-                    reporter
-                )
+        if chat_id not in self.workers or self.workers[chat_id].done():
+            self.workers[chat_id] = asyncio.create_task(
+                self.process_batch(chat_id)
             )
 
-    # -----------------------------------------
-    # ОБРАБОТЧИК ПАКЕТОВ
-    # -----------------------------------------
-
-    async def worker(
+    def create_record(
         self,
-        chat_id,
-        chat_type,
-        reporter
-    ):
+        message: Message,
+        bot_user: User,
+    ) -> MessageRecord:
+        content = message.text or message.caption or ""
 
-        current_task = asyncio.current_task()
+        return MessageRecord(
+            user_id=message.from_user.id,
+            username=message.from_user.username
+            or message.from_user.first_name
+            or "unknown",
+            text=content.strip(),
+            timestamp=time.monotonic(),
+            message_id=message.message_id,
+            is_question=self.is_question(content),
+            is_mentioned=self.is_mentioned(message, bot_user),
+            is_reply_to_bot=self.is_reply_to_bot(message, bot_user),
+            has_media=any([
+                message.photo,
+                message.video,
+                message.document,
+                message.animation,
+                message.sticker,
+                message.voice,
+                message.video_note,
+            ]),
+        )
 
+    async def process_batch(self, chat_id: int):
         try:
-
-            while True:
-
-                await asyncio.sleep(self.debounce)
-
-                batch = self.pending[chat_id]
-
-                if not batch:
-                    break
-
-                self.pending[chat_id] = []
-
-                decision = self.evaluate(
-                    chat_id,
-                    batch,
-                    chat_type
-                )
-
-                logger.info(
-                    "DECISION | chat=%s | action=%s | score=%.2f | reason=%s",
-                    chat_id,
-                    decision.action,
-                    decision.score,
-                    decision.reason
-                )
-
-                await reporter(
-                    chat_id,
-                    decision
-                )
-
-                # Если во время анализа пришли новые сообщения,
-                # они попадут в следующую итерацию.
+            while self.running:
+                await asyncio.sleep(self.batch_delay)
 
                 if not self.pending[chat_id]:
                     break
 
+                batch = self.pending[chat_id]
+                self.pending[chat_id] = []
+
+                decision = self.evaluate(chat_id, batch)
+
+                target_message_id = batch[-1].message_id
+
+                await self.reporter(
+                    chat_id,
+                    decision,
+                    target_message_id,
+                )
+
         except asyncio.CancelledError:
             raise
 
-        except Exception:
-
-            logger.exception(
-                "WORKER ERROR | chat=%s",
-                chat_id
-            )
-
         finally:
+            self.workers.pop(chat_id, None)
 
-            if self.tasks.get(chat_id) is current_task:
-                self.tasks.pop(chat_id, None)
-
-            # Защита от потери сообщения при завершении задачи.
-            if self.pending[chat_id] and chat_id not in self.tasks:
-
-                self.tasks[chat_id] = asyncio.create_task(
-                    self.worker(
-                        chat_id,
-                        chat_type,
-                        reporter
-                    )
+            if self.running and self.pending[chat_id]:
+                self.workers[chat_id] = asyncio.create_task(
+                    self.process_batch(chat_id)
                 )
-
-    # -----------------------------------------
-    # ГЛАВНАЯ ВЫЧИСЛИТЕЛЬНАЯ МАШИНА
-    # -----------------------------------------
 
     def evaluate(
         self,
-        chat_id,
-        batch,
-        chat_type
-    ):
+        chat_id: int,
+        batch: list[MessageRecord],
+    ) -> Decision:
+        if not batch:
+            return self.make(
+                "ignore",
+                "empty_batch",
+                0,
+            )
 
-        now = time.time()
-
-        recent = [
-            item
-            for item in self.history[chat_id]
-            if now - item.timestamp <= self.context_window
-        ]
-
-        participants = {
-            item.user_id
-            for item in recent
-        }
-
-        batch_users = {
-            item.user_id
-            for item in batch
-        }
-
-        target = batch[-1]
-
-        # Берём последнее содержательное сообщение.
-        for item in reversed(batch):
-            if item.text != "[медиа]":
-                target = item
-                break
+        latest = batch[-1]
+        history = list(self.history[chat_id])
 
         score = 0.0
         reasons = []
 
-        # -------------------------------------
-        # 1. ПРЯМОЕ ОБРАЩЕНИЕ
-        # -------------------------------------
+        # Прямое обращение к Мембу
+        if any(message.is_mentioned for message in batch):
+            score += 7.0
+            reasons.append("direct_mention")
 
-        if chat_type == "private":
+        # Ответ на сообщение Мембу
+        if any(message.is_reply_to_bot for message in batch):
+            score += 7.0
+            reasons.append("reply_to_bot")
 
-            score += 4.2
-            reasons.append("private_conversation")
+        # Личное сообщение
+        # В этой версии личные сообщения не обрабатываются
+        # как отдельный режим: решение остаётся частью общей логики.
 
-        else:
+        # Вопросы
+        if any(message.is_question for message in batch):
+            score += 1.8
+            reasons.append("question")
 
-            if any(item.mentioned for item in batch):
-
-                score += 4.8
-                reasons.append("direct_mention")
-
-            if any(item.replied_to for item in batch):
-
-                score += 5.0
-                reasons.append("reply_to_membu")
-
-        # -------------------------------------
-        # 2. ИНТЕРЕСНОСТЬ СООБЩЕНИЯ
-        # -------------------------------------
-
-        text = target.text.lower().strip()
-
-        if "?" in text:
-
+        # Сообщение содержит обращение к собеседникам
+        if any(self.has_direct_address(message.text) for message in batch):
             score += 0.8
-            reasons.append("question_detected")
+            reasons.append("direct_address")
 
-        if "!" in text:
-
-            score += 0.25
-
-        if len(text) > 100:
-
-            score += 0.35
+        # Содержательное сообщение
+        if any(self.has_substance(message.text) for message in batch):
+            score += 1.0
             reasons.append("substantial_message")
 
-        if len(text) > 300:
-
-            score += 0.25
-
-        interesting_patterns = [
-            r"\bпочему\b",
-            r"\bзачем\b",
-            r"\bпредставь\b",
-            r"\bприкинь\b",
-            r"\bинтересно\b",
-            r"\bнеужели\b",
-            r"\bчто если\b",
-            r"\bкак думаете\b",
-            r"\bкак считаете\b",
-            r"\bкстати\b",
-            r"\bлол\b",
-            r"\bахах\b",
-        ]
-
-        if any(
-            re.search(pattern, text)
-            for pattern in interesting_patterns
-        ):
-
-            score += 0.45
-            reasons.append("conversation_hook")
-
-        # -------------------------------------
-        # 3. КАЧЕСТВО СООБЩЕНИЯ
-        # -------------------------------------
-
-        normalized = re.sub(
-            r"[^\w\s]",
-            "",
-            text
-        ).strip()
-
-        if normalized in self.short_reactions:
-
-            score -= 2.2
+        # Короткие реакции обычно не требуют ответа
+        if all(self.is_short_reaction(message.text) for message in batch):
+            score -= 2.0
             reasons.append("short_reaction")
 
-        if len(normalized) <= 3:
+        # Медиа без текста редко требуют вмешательства
+        if all(
+            message.has_media and not message.text
+            for message in batch
+        ):
+            score -= 1.5
+            reasons.append("media_only")
 
-            score -= 1.0
-            reasons.append("very_short_message")
+        # Несколько участников могут означать живое обсуждение
+        participants = {
+            message.user_id
+            for message in batch
+        }
 
-        if text == "[медиа]":
-
-            score -= 2.0
-            reasons.append("media_without_caption")
-
-        # -------------------------------------
-        # 4. СОЦИАЛЬНАЯ СИТУАЦИЯ
-        # -------------------------------------
-
-        if len(recent) >= 4:
-
-            score -= 0.5
-            reasons.append("active_conversation")
-
-        if len(recent) >= 7:
-
-            score -= 0.8
-            reasons.append("very_active_conversation")
-
-        if len(participants) >= 3:
-
-            score -= 0.35
+        if len(participants) >= 2:
+            score += 0.8
             reasons.append("multiple_participants")
 
-        if len(batch) >= 3:
+        # Активная переписка
+        recent = [
+            message
+            for message in history
+            if time.monotonic() - message.timestamp < 45
+        ]
 
-            score -= 0.45
-            reasons.append("message_burst")
+        if len(recent) >= 5:
+            score += 0.8
+            reasons.append("active_conversation")
 
-        if len(batch_users) >= 2:
+        # Если разговор идёт слишком быстро, лучше не перебивать
+        if len(recent) >= 8:
+            score -= 1.2
+            reasons.append("fast_conversation")
 
-            score += 0.25
-            reasons.append("shared_conversation")
+        # Если последнее сообщение очень короткое
+        if len(latest.text) <= 3:
+            score -= 0.7
+            reasons.append("very_short_message")
 
-        # -------------------------------------
-        # 5. ПОВТОРНАЯ АКТИВНОСТЬ
-        # -------------------------------------
+        # Случайная небольшая вариативность
+        score += random.uniform(-0.35, 0.35)
 
-        previous_reply = self.last_reply[chat_id]
-
-        elapsed = now - previous_reply
-
-        if previous_reply:
-
-            if elapsed < 15:
-
-                score -= 2.8
-                reasons.append("very_recent_intervention")
-
-            elif elapsed < self.cooldown:
-
-                score -= 1.5
-                reasons.append("reply_cooldown")
-
-        # -------------------------------------
-        # 6. ПЕРЕМЕННАЯ ХАРИЗМА
-        # -------------------------------------
-
-        score += random.uniform(
-            -self.randomness,
-            self.randomness
+        # Защита от слишком частых ответов
+        elapsed = (
+            time.monotonic() - self.last_reply_time[chat_id]
         )
 
-        # -------------------------------------
-        # 7. ПРИНЯТИЕ РЕШЕНИЯ
-        # -------------------------------------
+        if elapsed < 20:
+            score -= 1.5
+            reasons.append("reply_cooldown")
+
+        elif elapsed < 45:
+            score -= 0.7
+            reasons.append("recent_reply")
+
+        # Если обращение прямое, cooldown не должен блокировать ответ
+        direct = any(
+            message.is_mentioned or message.is_reply_to_bot
+            for message in batch
+        )
+
+        if direct:
+            score = max(score, 7.0)
+
+        score = round(score, 2)
 
         if score >= 4.2:
+            self.last_reply_time[chat_id] = time.monotonic()
 
-            action = "reply"
+            return self.make(
+                "reply",
+                self.format_reason(reasons),
+                score,
+                reasons,
+            )
 
-        elif score >= 2.0:
+        if score >= 2.0:
+            return self.make(
+                "wait",
+                self.format_reason(reasons),
+                score,
+                reasons,
+            )
 
-            action = "wait"
-
-        else:
-
-            action = "ignore"
-
-        # Фиксируем гипотетическое вмешательство,
-        # даже если реального ответа пока нет.
-
-        if action == "reply":
-
-            self.last_reply[chat_id] = now
-
-        reason = (
-            ", ".join(reasons)
-            if reasons
-            else "no_social_trigger"
+        return self.make(
+            "ignore",
+            self.format_reason(reasons),
+            score,
+            reasons,
         )
 
+    def make(
+        self,
+        action: str,
+        reason: str,
+        score: float,
+        details: list[str] | None = None,
+    ) -> Decision:
         descriptions = {
-            "reply": "Мембу бы ответил на этот фрагмент переписки.",
-            "wait": "Мембу бы пока подождал развития разговора.",
-            "ignore": "Мембу бы проигнорировал эту ситуацию."
+            "reply": "Мембу решил бы ответить.",
+            "wait": "Мембу пока подождал бы.",
+            "ignore": "Мембу проигнорировал бы сообщение.",
         }
 
         return Decision(
             action=action,
             reason=reason,
-            score=round(score, 2),
-            target_message_id=target.message_id,
-            description=descriptions[action]
+            accepted=action == "reply",
+            description=descriptions[action],
+            score=score,
+            details=details or [],
         )
 
-    # -----------------------------------------
-    # TELEGRAM
-    # -----------------------------------------
+    def format_reason(self, reasons: list[str]) -> str:
+        if not reasons:
+            return "no_significant_signals"
 
-    def is_mentioned(self, message, bot_user):
+        return ", ".join(reasons)
 
+    def is_question(self, text: str) -> bool:
+        if not text:
+            return False
+
+        question_words = (
+            "кто",
+            "что",
+            "где",
+            "когда",
+            "почему",
+            "зачем",
+            "как",
+            "какой",
+            "какая",
+            "какие",
+            "сколько",
+            "чего",
+            "кому",
+            "чем",
+            "можно",
+            "будет",
+            "есть ли",
+        )
+
+        normalized = text.lower().strip()
+
+        return (
+            "?" in normalized
+            or normalized.startswith(question_words)
+        )
+
+    def is_mentioned(self, message: Message, bot_user: User) -> bool:
         content = message.text or message.caption or ""
-
-        entities = (
-            message.entities
-            or message.caption_entities
-            or []
-        )
+        entities = message.entities or message.caption_entities or []
 
         for entity in entities:
-
             if entity.type == "text_mention":
-
                 if entity.user and entity.user.id == bot_user.id:
                     return True
 
             if entity.type == "mention" and bot_user.username:
-
                 mention = content[
-                    entity.offset:
-                    entity.offset + entity.length
+                    entity.offset:entity.offset + entity.length
                 ]
 
-                if mention.casefold() == (
-                    f"@{bot_user.username}".casefold()
-                ):
-
+                if mention.casefold() == f"@{bot_user.username}".casefold():
                     return True
 
-        # Также распознаём обычное написание имени.
-
-        if re.search(
-            r"\bмембу\b",
-            content,
-            re.IGNORECASE
-        ):
-
+        if re.search(r"\bмембу\b", content, re.IGNORECASE):
             return True
 
         return False
 
-    def is_reply_to_bot(self, message, bot_user):
-
+    def is_reply_to_bot(
+        self,
+        message: Message,
+        bot_user: User,
+    ) -> bool:
         reply = message.reply_to_message
 
         return (
@@ -495,3 +375,89 @@ class MembuCore:
             and reply.from_user is not None
             and reply.from_user.id == bot_user.id
         )
+
+    def has_direct_address(self, text: str) -> bool:
+        if not text:
+            return False
+
+        patterns = [
+            r"\bребят\b",
+            r"\bнарод\b",
+            r"\bпарни\b",
+            r"\bдрузья\b",
+            r"\bслушайте\b",
+            r"\bсмотрите\b",
+            r"\bкстати\b",
+        ]
+
+        return any(
+            re.search(pattern, text, re.IGNORECASE)
+            for pattern in patterns
+        )
+
+    def has_substance(self, text: str) -> bool:
+        if not text:
+            return False
+
+        words = text.split()
+
+        if len(words) >= 8:
+            return True
+
+        if len(words) >= 5 and len(text) >= 35:
+            return True
+
+        return False
+
+    def is_short_reaction(self, text: str) -> bool:
+        if not text:
+            return False
+
+        normalized = text.lower().strip()
+        words = normalized.split()
+
+        reactions = {
+            "ахах",
+            "ахахах",
+            "хах",
+            "хаха",
+            "лол",
+            "кек",
+            "да",
+            "нет",
+            "ага",
+            "неа",
+            "пон",
+            "ясно",
+            "ок",
+            "окей",
+            "жесть",
+            "мда",
+            "ого",
+            "понятно",
+        }
+
+        return (
+            len(words) <= 2
+            and (
+                normalized in reactions
+                or len(normalized) <= 5
+            )
+        )
+
+    async def shutdown(self):
+        self.running = False
+
+        tasks = list(self.workers.values())
+
+        for task in tasks:
+            task.cancel()
+
+        if tasks:
+            await asyncio.gather(
+                *tasks,
+                return_exceptions=True,
+            )
+
+        self.workers.clear()
+        self.pending.clear()
