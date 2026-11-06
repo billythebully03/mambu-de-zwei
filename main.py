@@ -23,19 +23,20 @@ bot_user: User | None = None
 async def handle_message(message: Message):
     decision = membu.process(message, bot_user)
 
-    if not decision.accepted:
-        return
-
-    if decision.reply_text:
-        await message.answer(decision.reply_text)
-        return
-
     logging.info(
-        "MEMBU EVENT | chat_id=%s | user_id=%s | reason=%s",
+        "MEMBU | chat=%s | user=%s | decision=%s | reason=%s",
         message.chat.id,
         message.from_user.id if message.from_user else None,
+        decision.action,
         decision.reason
     )
+
+    if message.chat.type == "private":
+        await message.answer(decision.description)
+        return
+
+    if decision.accepted:
+        await message.answer(decision.description)
 
 
 async def main():
@@ -52,7 +53,12 @@ async def main():
 
     logging.info("Membu started as @%s", bot_user.username)
 
-    await dp.start_polling(bot)
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    await dp.start_polling(
+        bot,
+        allowed_updates=dp.resolve_used_update_types()
+    )
 
 
 if __name__ == "__main__":
