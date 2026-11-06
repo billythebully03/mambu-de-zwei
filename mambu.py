@@ -5,36 +5,61 @@ from aiogram.types import Message, User
 
 @dataclass
 class Decision:
-    accepted: bool
+    action: str
     reason: str
-    reply_text: str | None = None
+    accepted: bool
+    description: str
 
 
 class MembuCore:
 
     def process(self, message: Message, bot_user: User) -> Decision:
-        if message.chat.type == "private":
-            return Decision(
-                accepted=True,
-                reason="private_message",
-                reply_text="Мембу на связи. Пока работаю в тестовом режиме."
+        if message.from_user and message.from_user.is_bot:
+            return self.make(
+                "ignore",
+                "bot_message",
+                False
             )
 
-        if self.is_mentioned(message, bot_user):
-            return Decision(
-                accepted=True,
-                reason="mentioned"
+        if message.chat.type == "private":
+            return self.make(
+                "reply",
+                "private_message",
+                True
             )
 
         if self.is_reply_to_bot(message, bot_user):
-            return Decision(
-                accepted=True,
-                reason="reply_to_membu"
+            return self.make(
+                "reply",
+                "reply_to_membu",
+                True
             )
 
+        if self.is_mentioned(message, bot_user):
+            return self.make(
+                "reply",
+                "mentioned",
+                True
+            )
+
+        return self.make(
+            "ignore",
+            "ordinary_group_message",
+            False
+        )
+
+    def make(self, action: str, reason: str, accepted: bool) -> Decision:
+        descriptions = {
+            "reply": "Мембу бы ответил на это сообщение.",
+            "ignore": "Мембу бы проигнорировал это сообщение.",
+            "wait": "Мембу бы пока промолчал, но оставил сообщение в поле внимания."
+        }
+
         return Decision(
-            accepted=False,
-            reason="not_relevant"
+            action=action,
+            reason=reason,
+            accepted=accepted,
+            description=descriptions[action]
         )
 
     def is_mentioned(self, message: Message, bot_user: User) -> bool:
@@ -47,7 +72,9 @@ class MembuCore:
                     return True
 
             if entity.type == "mention" and bot_user.username:
-                mention = content[entity.offset:entity.offset + entity.length]
+                mention = content[
+                    entity.offset:entity.offset + entity.length
+                ]
 
                 if mention.casefold() == f"@{bot_user.username}".casefold():
                     return True
