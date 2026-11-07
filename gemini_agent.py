@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -33,6 +34,13 @@ TELEGRAM_REACTIONS = [
 
 MIN_MESSAGES_FOR_STYLE_UPDATE = 15
 
+# Ограничения на редактирование.
+EDIT_WINDOW_SECONDS = 10 * 60
+EDIT_COOLDOWN_SECONDS = 5 * 60
+EDIT_MAX_PER_HOUR = 3
+EDIT_MAX_TEXT_LENGTH = 4000
+EDIT_MAX_REASON_LENGTH = 300
+
 
 class GeminiAgent:
     def __init__(
@@ -50,6 +58,13 @@ class GeminiAgent:
         self.bot_user = bot_user
         self.model = model
         self.activity_callback = activity_callback
+
+        # Защита от одновременного редактирования в одном чате.
+        self._edit_locks: dict[int, asyncio.Lock] = {}
+
+        # Дополнительная защита на случай, если Telegram успешно
+        # отредактировал сообщение, но запись в Supabase не удалась.
+        self._edited_message_ids: set[tuple[int, int]] = set()
 
         base_dir = Path(__file__).resolve().parent
 
@@ -314,6 +329,82 @@ class GeminiAgent:
                     "required": ["style_profile"],
                 },
             ),
+
+            types.FunctionDeclaration(
+                name="search_own_messages",
+                description=(
+                    "Ищет старые текстовые сообщения, которые сам Мембу отправлял "
+                    "в текущем Telegram-чате. Используй, когда нужно проверить, "
+                    "что именно ты раньше говорил, найти собственное обещание, "
+                    "вернуться к старой теме или не противоречить себе. "
+                    "Поиск идёт по словам или точной фразе, а не по смысловой близости. "
+                    "Не вызывай перед каждым ответом. В результатах будут точные "
+                    "message_id — используй только их, если понадобится редактирование."
+                ),
+                parameters_json_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": (
+                                "Слова или фраза, которые должны встречаться "
+                                "в собственном старом сообщении Мембу."
+                            ),
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Количество результатов от 1 до 8.",
+                        },
+                    },
+                    "required": ["query"],
+                },
+            ),
+
+            types.FunctionDeclaration(
+                name="edit_own_message",
+                description=(
+                    "Редактирует одно из собственных текстовых сообщений Мембу "
+                    "в текущем чате. Вызывай крайне редко и только при реальной "
+                    "необходимости: существенная фактическая ошибка, вводящая "
+                    "в заблуждение формулировка или пропущенная важная деталь. "
+                    "Не редактируй ради красоты, стилистической полировки, "
+                    "более удачной шутки или потому, что придумал формулировку получше. "
+                    "Разрешено только одно редактирование каждого сообщения, "
+                    "только в течение 10 минут после отправки. Общий лимит: "
+                    "одна правка за 5 минут и три правки за час на весь чат. "
+                    "Система дополнительно проверяет владельца сообщения, время "
+                    "отправки и лимиты. message_id должен быть взят из контекста "
+                    "или результатов search_own_messages. Никогда не угадывай ID. "
+                    "Нельзя редактировать чужие сообщения и стикеры. "
+                    "Укажи короткую содержательную причину изменения. "
+                    "Если сомневаешься — оставь исходное сообщение."
+                ),
+                parameters_json_schema={
+                    "type": "object",
+                    "properties": {
+                        "message_id": {
+                            "type": "integer",
+                            "description": "Точный ID собственного сообщения Мембу.",
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "Новый полный текст сообщения.",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": (
+                                "Почему исправление действительно необходимо. "
+                                "Не используй косметические причины."
+                            ),
+                        },
+                    },
+                    "required": [
+                        "message_id",
+                        "text",
+                        "reason",
+                    ],
+                },
+            ),
         ]
 
         if self.stickers:
@@ -372,6 +463,25 @@ class GeminiAgent:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _parse_datetime(value) -> datetime | None:
+        if isinstance(value, datetime):
+            result = value
+        elif isinstance(value, str):
+            try:
+                result = datetime.fromisoformat(
+                    value.replace("Z", "+00:00")
+                )
+            except ValueError:
+                return None
+        else:
+            return None
+
+        if result.tzinfo is None:
+            result = result.replace(tzinfo=timezone.utc)
+
+        return result.astimezone(timezone.utc)
+
     async def _store_bot_message(
         self,
         chat_id: int,
@@ -404,6 +514,322 @@ class GeminiAgent:
             )
 
         self._mark_chat_activity(chat_id)
+
+    async def _edit_own_message(
+        self,
+        chat_id: int,
+        args: dict,
+        is_stale: Callable[[], bool] | None = None,
+    ) -> dict:
+        """Проверяет ограничения и редактирует только собственное сообщение."""
+
+        if is_stale and is_stale():
+            return {
+                "edited": False,
+                "cancelled": True,
+                "reason": "В чате уже появилось новое сообщение.",
+            }
+
+        try:
+            message_id = int(args.get("message_id"))
+        except (TypeError, ValueError):
+            return {
+                "edited": False,
+                "error": "Некорректный message_id.",
+            }
+
+        new_text = str(args.get("text", "")).strip()
+        reason = str(args.get("reason", "")).strip()
+
+        if not new_text:
+            return {
+                "edited": False,
+                "error": "Новый текст пуст.",
+            }
+
+        if len(new_text) > EDIT_MAX_TEXT_LENGTH:
+            return {
+                "edited": False,
+                "error": (
+                    f"Новый текст слишком длинный. "
+                    f"Максимум {EDIT_MAX_TEXT_LENGTH} символов."
+                ),
+            }
+
+        if len(reason) < 12:
+            return {
+                "edited": False,
+                "error": (
+                    "Нужно указать содержательную причину "
+                    "редактирования, а не косметическое улучшение."
+                ),
+            }
+
+        if len(reason) > EDIT_MAX_REASON_LENGTH:
+            reason = reason[:EDIT_MAX_REASON_LENGTH]
+
+        lock = self._edit_locks.setdefault(
+            chat_id,
+            asyncio.Lock(),
+        )
+
+        async with lock:
+            if is_stale and is_stale():
+                return {
+                    "edited": False,
+                    "cancelled": True,
+                    "reason": "Контекст устарел до редактирования.",
+                }
+
+            local_key = (chat_id, message_id)
+
+            if local_key in self._edited_message_ids:
+                return {
+                    "edited": False,
+                    "error": "Это сообщение уже редактировалось.",
+                }
+
+            try:
+                message = await asyncio.to_thread(
+                    self.storage.get_own_message,
+                    chat_id,
+                    message_id,
+                    self.bot_user.id,
+                )
+            except Exception:
+                logging.exception(
+                    "Не удалось проверить собственное сообщение "
+                    "для редактирования: chat=%s message=%s",
+                    chat_id,
+                    message_id,
+                )
+                return {
+                    "edited": False,
+                    "error": "Не удалось проверить сообщение в базе.",
+                }
+
+            if not message:
+                return {
+                    "edited": False,
+                    "error": (
+                        "Сообщение не найдено среди собственных сообщений "
+                        "Мембу. Чужие сообщения редактировать нельзя."
+                    ),
+                }
+
+            old_text = str(message.get("text", ""))
+
+            # Стикеры в истории представлены служебной текстовой записью,
+            # а не текстовым Telegram-сообщением.
+            if old_text.startswith("[СТИКЕР:"):
+                return {
+                    "edited": False,
+                    "error": "Стикеры нельзя редактировать этим инструментом.",
+                }
+
+            created_at = self._parse_datetime(
+                message.get("created_at")
+            )
+
+            if created_at is None:
+                return {
+                    "edited": False,
+                    "error": "Не удалось определить время отправки сообщения.",
+                }
+
+            now = datetime.now(timezone.utc)
+            age_seconds = (now - created_at).total_seconds()
+
+            if age_seconds < -60:
+                return {
+                    "edited": False,
+                    "error": "Время отправки сообщения некорректно.",
+                }
+
+            if age_seconds > EDIT_WINDOW_SECONDS:
+                return {
+                    "edited": False,
+                    "error": (
+                        "Прошло больше 10 минут после отправки. "
+                        "Это сообщение уже нельзя редактировать."
+                    ),
+                }
+
+            # Не допускаем изменений только пробелов или регистра.
+            old_normalized = " ".join(old_text.split()).casefold()
+            new_normalized = " ".join(new_text.split()).casefold()
+
+            if old_normalized == new_normalized:
+                return {
+                    "edited": False,
+                    "error": "Новый текст практически не отличается от исходного.",
+                }
+
+            try:
+                already_edited = await asyncio.to_thread(
+                    self.storage.has_message_been_edited,
+                    chat_id,
+                    message_id,
+                )
+            except Exception:
+                logging.exception(
+                    "Не удалось проверить историю редактирования "
+                    "chat=%s message=%s",
+                    chat_id,
+                    message_id,
+                )
+                return {
+                    "edited": False,
+                    "error": "Не удалось проверить историю изменений.",
+                }
+
+            if already_edited:
+                return {
+                    "edited": False,
+                    "error": "Это сообщение уже редактировалось. Повторная правка запрещена.",
+                }
+
+            try:
+                recent_edits = await asyncio.to_thread(
+                    self.storage.recent_message_edits,
+                    chat_id,
+                    self.bot_user.id,
+                    60,
+                    EDIT_MAX_PER_HOUR,
+                )
+            except Exception:
+                logging.exception(
+                    "Не удалось проверить лимиты редактирования для chat=%s",
+                    chat_id,
+                )
+                return {
+                    "edited": False,
+                    "error": "Не удалось проверить лимиты редактирования.",
+                }
+
+            if len(recent_edits) >= EDIT_MAX_PER_HOUR:
+                return {
+                    "edited": False,
+                    "error": (
+                        "Достигнут лимит: не более трёх редактирований "
+                        "за один час на весь чат."
+                    ),
+                }
+
+            if recent_edits:
+                last_edit_at = self._parse_datetime(
+                    recent_edits[0].get("edited_at")
+                )
+
+                if last_edit_at is None:
+                    return {
+                        "edited": False,
+                        "error": "Не удалось проверить время последней правки.",
+                    }
+
+                seconds_since_last_edit = (
+                    now - last_edit_at
+                ).total_seconds()
+
+                if seconds_since_last_edit < EDIT_COOLDOWN_SECONDS:
+                    remaining = max(
+                        1,
+                        int(
+                            EDIT_COOLDOWN_SECONDS
+                            - seconds_since_last_edit
+                        ),
+                    )
+                    return {
+                        "edited": False,
+                        "error": (
+                            "Слишком частые правки. "
+                            f"Следующая разрешена примерно через {remaining} секунд."
+                        ),
+                    }
+
+            if is_stale and is_stale():
+                return {
+                    "edited": False,
+                    "cancelled": True,
+                    "reason": "В чате появилось новое сообщение до редактирования.",
+                }
+
+            try:
+                await self.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=new_text,
+                )
+            except TelegramAPIError as exc:
+                return {
+                    "edited": False,
+                    "error": str(exc)[:350],
+                }
+
+            # Сразу блокируем повторную попытку в этом процессе,
+            # даже если последующая запись в Supabase завершится ошибкой.
+            self._edited_message_ids.add(local_key)
+
+            try:
+                history_result = await asyncio.to_thread(
+                    self.storage.record_message_edit,
+                    chat_id,
+                    message_id,
+                    self.bot_user.id,
+                    old_text,
+                    new_text,
+                    reason,
+                )
+            except Exception:
+                logging.exception(
+                    "Telegram отредактировал сообщение, "
+                    "но не удалось записать историю: chat=%s message=%s",
+                    chat_id,
+                    message_id,
+                )
+                return {
+                    "edited": True,
+                    "message_id": message_id,
+                    "history_saved": False,
+                    "warning": (
+                        "Telegram принял правку, но сохранить историю "
+                        "в Supabase не удалось. Повторно это сообщение "
+                        "редактировать нельзя."
+                    ),
+                }
+
+            if not history_result.get("recorded"):
+                logging.error(
+                    "Сообщение отредактировано в Telegram, "
+                    "но Supabase не подтвердил запись: chat=%s message=%s result=%s",
+                    chat_id,
+                    message_id,
+                    history_result,
+                )
+                return {
+                    "edited": True,
+                    "message_id": message_id,
+                    "history_saved": False,
+                    "warning": (
+                        "Telegram принял правку, но база не подтвердила "
+                        "сохранение истории. Повторная правка запрещена."
+                    ),
+                }
+
+            self._mark_chat_activity(chat_id)
+
+            logging.info(
+                "MEMBU_EDIT | chat=%s | message=%s | reason=%s",
+                chat_id,
+                message_id,
+                reason[:120],
+            )
+
+            return {
+                "edited": True,
+                "message_id": message_id,
+                "history_saved": True,
+            }
 
     async def _execute_tool(
         self,
@@ -488,6 +914,49 @@ class GeminiAgent:
             )
 
             return result
+
+        if name == "search_own_messages":
+            query = str(args.get("query", "")).strip()
+
+            if len(query) < 2:
+                return {
+                    "error": "Для поиска укажи хотя бы два символа или слова."
+                }
+
+            try:
+                limit = int(args.get("limit", 5))
+            except (TypeError, ValueError):
+                limit = 5
+
+            try:
+                messages = await asyncio.to_thread(
+                    self.storage.search_own_messages,
+                    chat_id,
+                    self.bot_user.id,
+                    query,
+                    max(1, min(limit, 8)),
+                )
+            except Exception:
+                logging.exception(
+                    "Ошибка поиска собственных сообщений Мембу: chat=%s",
+                    chat_id,
+                )
+                return {
+                    "error": "Не удалось выполнить поиск по истории сообщений."
+                }
+
+            return {
+                "messages": messages,
+                "matched": len(messages),
+                "search_type": "literal_substring",
+            }
+
+        if name == "edit_own_message":
+            return await self._edit_own_message(
+                chat_id=chat_id,
+                args=args,
+                is_stale=is_stale,
+            )
 
         if name == "send_message":
             text = str(args.get("text", "")).strip()
@@ -674,6 +1143,29 @@ class GeminiAgent:
             "сообщения участников, а не собственные сообщения или сообщения других "
             "ботов. Не ставь реакцию на системные события о входе/выходе участников.\n\n"
 
+            "Если тебе нужно вспомнить, что ты сам говорил раньше, можешь "
+            "вызвать search_own_messages. Поиск выполняется по буквальному "
+            "совпадению слов или фразы в твоих сообщениях этого чата. "
+            "Это не семантический поиск. Не вызывай его без конкретной причины "
+            "и не ищи историю перед каждым ответом. Используй найденные сообщения, "
+            "чтобы сохранять последовательность и возвращаться к старым темам.\n\n"
+
+            "У тебя есть возможность редактировать свои сообщения через "
+            "edit_own_message, но это исключительный инструмент, а не способ "
+            "улучшать каждую реплику задним числом. Редактируй только если "
+            "действительно допустил существенную фактическую ошибку, написал "
+            "вводящую в заблуждение формулировку или пропустил важную деталь. "
+            "Не переписывай шутки, стиль, тон или обычные формулировки только "
+            "потому, что теперь придумал вариант получше. Не пытайся скрывать "
+            "своё мнение или менять историю разговора. Сначала убедись, что "
+            "исправление необходимо. Для поиска старого сообщения используй "
+            "search_own_messages, если его ID нет в текущем контексте. "
+            "Передавай точный message_id из результата поиска или контекста. "
+            "Никогда не угадывай ID и не редактируй чужие сообщения. "
+            "Система разрешает одну правку сообщения в первые 10 минут, "
+            "не чаще одной правки за 5 минут и трёх за час на весь чат. "
+            "Если инструмент отклонил правку, не пытайся обойти ограничение.\n\n"
+
             "Профиль chat_style — постепенно собранное описание общей манеры "
             "общения компании. Используй его как дополнительный ориентир, а не как "
             "новую личность. Сохраняй собственный характер Мембу. Подхватывай общий "
@@ -702,7 +1194,9 @@ class GeminiAgent:
 
             "Обычный текстовый ответ модели сам по себе не отправляется. Для любого "
             "сообщения, стикера или реакции используй соответствующий инструмент. "
-            "Вызов update_chat_style не считается публичным сообщением.\n\n"
+            "Вызов update_chat_style, search_own_messages и edit_own_message "
+            "не считается публичным новым сообщением. Редактирование меняет уже "
+            "отправленное сообщение.\n\n"
 
             "Контекст:\n"
             + json.dumps(
@@ -773,6 +1267,9 @@ class GeminiAgent:
                 if call.name == "send_reaction" and result.get("reacted"):
                     performed_chat_action = True
 
+                if call.name == "edit_own_message" and result.get("edited"):
+                    performed_chat_action = True
+
                 function_response = types.Part.from_function_response(
                     name=call.name,
                     response={"result": result},
@@ -785,7 +1282,7 @@ class GeminiAgent:
                     )
                 )
 
-            # После публичного действия не просим модель тут же генерировать
-            # ещё одну реплику. Она уже поучаствовала в разговоре.
+            # После публичного действия или редактирования не просим
+            # модель тут же генерировать ещё одну реплику.
             if performed_chat_action:
                 return
