@@ -40,6 +40,10 @@ MAX_DEBOUNCE_WAIT_SECONDS = float(
 # Очередь ответов одного чата. Ответы выполняются строго по очереди.
 MAX_CHAT_QUEUE = int(os.getenv("MEMBU_MAX_CHAT_QUEUE", "30"))
 
+# Сколько последних сообщений чата видит модель в каждом контексте.
+# Без этого «вспомни, что обсуждали» работает только если модель сама вызовет поиск.
+RECENT_MESSAGES_FOR_CONTEXT = int(os.getenv("MEMBU_RECENT_MESSAGES", "60"))
+
 BRANCH_TTL = int(
     os.getenv("MEMBU_BRANCH_TTL_SECONDS", "300")
 )
@@ -272,7 +276,7 @@ async def run_agent_with_context(
         recent = await asyncio.to_thread(
             storage.recent_messages,
             chat_id,
-            18,
+            RECENT_MESSAGES_FOR_CONTEXT,
         )
 
         branch_messages = []

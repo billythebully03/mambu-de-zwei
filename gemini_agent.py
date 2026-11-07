@@ -1075,7 +1075,10 @@ class GeminiAgent:
             },
             "bot_status": bot_status or {},
             "core_memories": core_memories[:MEMORY_IN_CONTEXT],
-            "recent_messages": recent_messages,
+            "recent_messages": [
+                {**m, "text": str(m.get("text", ""))[:300]}
+                for m in recent_messages
+            ],
             "current_branch_messages": branch_messages,
             "active_branches": active_branches,
             "chat_style": chat_style,
@@ -1178,6 +1181,9 @@ class GeminiAgent:
         # from_function_response() в установленной версии SDK
         # не принимает поле id.
 
+        used_tools = False
+        nudged = False
+
         for _ in range(8):
             if is_stale and is_stale():
                 return
@@ -1192,9 +1198,33 @@ class GeminiAgent:
             calls = response.function_calls or []
 
             if not calls:
+                # Текст сам по себе в чат не уходит. Если модель искала в истории
+                # и ничего не отправила, один раз просим её вызвать send_message.
+                if direct and used_tools and not nudged:
+                    nudged = True
+                    if response.candidates and response.candidates[0].content:
+                        contents.append(response.candidates[0].content)
+                    contents.append(
+                        types.Content(
+                            role="user",
+                            parts=[
+                                types.Part.from_text(
+                                    text=(
+                                        "Ты искал в истории или памяти, но ответ "
+                                        "не отправлен. Если хочешь ответить человеку, "
+                                        "вызови send_message (или send_sticker / "
+                                        "send_reaction) сейчас. Если нет — ничего не делай."
+                                    )
+                                )
+                            ],
+                        )
+                    )
+                    continue
+
                 # Модель решила промолчать либо ответила обычным текстом.
-                # Текст сам по себе никогда не отправляется в чат.
                 return
+
+            used_tools = True
 
             if response.candidates and response.candidates[0].content:
                 contents.append(
