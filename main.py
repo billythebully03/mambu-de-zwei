@@ -867,6 +867,27 @@ async def clearall_command(message: Message) -> None:
     )
 
 
+@router.message(Command("reset"))
+async def reset_command(message: Message) -> None:
+    if not is_owner_dm(message.from_user, message.chat.type):
+        return
+
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Да, перезапустить", callback_data="rst:yes"),
+                InlineKeyboardButton(text="Отмена", callback_data="rst:no"),
+            ]
+        ]
+    )
+    await message.answer(
+        "Полный перезапуск Мембу с нуля. Будет стёрто: обычные воспоминания (важность 1–3), "
+        "вся история сообщений, сессионная память ИИ, выученный стиль чата и мнения о людях. "
+        "Важные воспоминания (важность 4–5) и личность Мембу останутся. Это нельзя будет отменить.",
+        reply_markup=markup,
+    )
+
+
 @router.message(Command("status"))
 async def status_command(message: Message) -> None:
     if not is_owner_dm(message.from_user, message.chat.type):
@@ -1057,7 +1078,7 @@ async def people_command(message: Message) -> None:
 
 
 @router.callback_query(
-    F.data.startswith(("mem:", "msg:", "ppl:", "tab:", "clr:"))
+    F.data.startswith(("mem:", "msg:", "ppl:", "tab:", "clr:", "rst:"))
 )
 async def handle_owner_callbacks(callback: CallbackQuery) -> None:
     message = callback.message
@@ -1077,6 +1098,28 @@ async def handle_owner_callbacks(callback: CallbackQuery) -> None:
             else:
                 text, markup = await memory_page_view(0)
             await message.edit_text(text, reply_markup=markup)
+            await callback.answer()
+            return
+
+        if kind == "rst":
+            if parts[1] == "yes":
+                memories = await asyncio.to_thread(storage.delete_unimportant_memories, 4)
+                messages = await asyncio.to_thread(storage.delete_all_messages)
+                branches = await asyncio.to_thread(storage.close_all_branches)
+                people = await asyncio.to_thread(storage.delete_all_people)
+                await asyncio.to_thread(storage.reset_chat_styles)
+                await asyncio.to_thread(storage.reset_digest_counts)
+                agent.reset_learned_state()
+                await message.edit_text(
+                    "Перезапуск выполнен.\n"
+                    f"Обычных воспоминаний стёрто: {memories}\n"
+                    f"Сообщений стёрто: {messages}\n"
+                    f"Веток разговора закрыто: {branches}\n"
+                    f"Мнений о людях стёрто: {people}\n\n"
+                    "Стиль чата сброшен. Важные воспоминания (4–5) и личность Мембу на месте."
+                )
+            else:
+                await message.edit_text("Отменено. Ничего не сброшено.")
             await callback.answer()
             return
 

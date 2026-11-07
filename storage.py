@@ -455,6 +455,29 @@ class MembuStorage:
         )
         return len(result.data or [])
 
+    def delete_all_people(self) -> int:
+        """Стирает мнения о людях всех чатов."""
+        result = (
+            self.client.table("membu_people")
+            .delete()
+            .neq("chat_id", 0)
+            .execute()
+        )
+        return len(result.data or [])
+
+    def reset_chat_styles(self) -> None:
+        """Сбрасывает выученный стиль чата: Мембу снова опирается только на PERSONALITY."""
+        (
+            self.client.table("membu_chat_profiles")
+            .update({
+                "style_profile": "",
+                "observed_messages": 0,
+                "last_analyzed_message_count": 0,
+            })
+            .neq("chat_id", 0)
+            .execute()
+        )
+
     def reset_digest_counts(self) -> None:
         """Сбрасывает счётчик дайджеста: после стирания сообщений считать заново."""
         (

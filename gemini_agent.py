@@ -1604,6 +1604,11 @@ class GeminiAgent:
         if "resource_exhausted" in lowered or "429" in text or "quota" in lowered:
             self.quota_reset_at = quota_reset_time(text, now)
 
+    def reset_learned_state(self) -> None:
+        """Полный сброс выученного: стиль и кэши. Личность (PERSONALITY) остаётся."""
+        self.reset_session_state()
+        self._style_cache.clear()
+
     def reset_session_state(self) -> None:
         """Сбрасывает сессионную память ИИ: кэши и таймеры фоновых анализов.
         Стиль и мнения о людях не трогает."""
