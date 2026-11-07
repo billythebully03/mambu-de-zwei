@@ -132,8 +132,17 @@ chat_idle_tasks: dict[int, asyncio.Task] = {}
 chat_last_idle_attempt: dict[int, float] = {}
 
 
-GREETING_MORNING = re.compile(r"^\W*(доброе утро|доброго утра|утра|утро|good morning)(\W+\w{1,10})?\W*$", re.IGNORECASE)
-GREETING_NIGHT = re.compile(r"^\W*(спокойной ночи|сладких снов|доброй ночи|спокойной ночки)(\W+\w{1,10})?\W*$", re.IGNORECASE)
+GREETING_MORNING = re.compile(
+    r"^\W*(доброе утро|доброго утра|доброе утречко|доброго утречка|с добрым утром|"
+    r"утречка|утречко|утра|утро|good morning)(\W+\w{1,10})?\W*$",
+    re.IGNORECASE,
+)
+GREETING_NIGHT = re.compile(
+    r"^\W*(спокойной ночи|спокойной ночки|спокойной ночь|сладких снов|доброй ночи|"
+    r"доброй ночки|приятных снов|спокойного сна|спать пора|ночи|good night)"
+    r"(\W+\w{1,10})?\W*$",
+    re.IGNORECASE,
+)
 _greeting_marks: set[tuple] = set()
 
 
@@ -177,7 +186,7 @@ def is_mentioned(message: Message, current_bot: User) -> bool:
 
     # Имя в тексте тоже считается обращением: запрос уходит в ИИ, а он сам решает,
     # ответить, поставить реакцию или промолчать.
-    name_pattern = r"(?<![\w])(мембу|membu)(?!\w)"
+    name_pattern = r"(?<!\w)(мемб|мэмб|memb)\w*"
     if re.search(name_pattern, text, flags=re.IGNORECASE):
         return True
 
