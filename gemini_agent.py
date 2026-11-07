@@ -58,6 +58,77 @@ STYLE_ANALYST_INSTRUCTION = (
     "личные сведения. Пиши простым текстом, до 2000 символов, без markdown."
 )
 
+# Дайджест: раз в столько новых сообщений модель выделяет из переписки
+# долговременные факты и записывает их в память чата.
+DIGEST_EVERY_MESSAGES = 80
+DIGEST_SAMPLE_SIZE = 120
+DIGEST_CHECK_INTERVAL_SECONDS = 60
+
+DIGEST_INSTRUCTION = (
+    "Ты помогаешь Telegram-боту Мембу помнить чат. Из переписки выдели 2–5 "
+    "долговечных фактов, которые стоит запомнить: о чём договорились, какие темы "
+    "обсуждали и чем закончили, предпочтения людей, внутренние шутки, устойчивые "
+    "мнения, незавершённые дела. Не пересказывай каждую реплику и не записывай "
+    "случайное. Не сохраняй пароли, документы, здоровье, личные секреты и "
+    "чувствительные сведения. Верни ТОЛЬКО JSON-массив без пояснений. Каждый элемент: "
+    "{\"category\": одна из profile, preference, relationship, ongoing, event, "
+    "inside_joke, opinion; \"content\": краткая формулировка до 300 символов; "
+    "\"importance\": число от 1 до 5; \"people\": массив имён}. Если важного нет, "
+    "верни []."
+)
+
+
+def parse_digest_items(raw: str) -> list[dict]:
+    """Разбирает ответ дайджеста. Некорректные элементы пропускает."""
+    text = (raw or "").strip()
+
+    if text.startswith("```"):
+        text = text.strip("`").strip()
+        if text.lower().startswith("json"):
+            text = text[4:]
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        logging.warning("Дайджест памяти: ответ не является JSON")
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    items: list[dict] = []
+
+    for raw_item in data[:5]:
+        if not isinstance(raw_item, dict):
+            continue
+
+        category = raw_item.get("category")
+        content = str(raw_item.get("content", "")).strip()
+
+        if category not in MEMORY_CATEGORIES or not content:
+            continue
+
+        try:
+            importance = int(raw_item.get("importance", 3))
+        except (TypeError, ValueError):
+            importance = 3
+
+        people = raw_item.get("people") or []
+        if not isinstance(people, list):
+            people = []
+
+        items.append(
+            {
+                "category": category,
+                "content": content[:1500],
+                "importance": max(1, min(importance, 5)),
+                "people": [str(p) for p in people][:10],
+            }
+        )
+
+    return items
+
+
 class GeminiAgent:
     def __init__(
         self,
@@ -86,6 +157,10 @@ class GeminiAgent:
 
         # Удерживаем ссылки на фоновые задачи, чтобы их не собрал GC.
         self._background: set[asyncio.Task] = set()
+
+        # Дайджест памяти: аналогичные проверка и защита от параллельного запуска.
+        self._digest_checked_at: dict[int, float] = {}
+        self._digest_running: set[int] = set()
 
         base_dir = Path(__file__).resolve().parent
 
@@ -353,6 +428,65 @@ class GeminiAgent:
                 },
             ),
 
+            types.FunctionDeclaration(
+                name="search_chat_history",
+                description=(
+                    "Ищет по всей истории этого чата: и сообщения людей, и твои. "
+                    "Используй, когда нужно вспомнить, что именно обсуждали, кто что "
+                    "говорил или когда. Слова ищутся по основе, с учётом окончаний, "
+                    "и все слова должны встречаться в сообщении. Для более старых "
+                    "сообщений передай before. Не вызывай без конкретной причины "
+                    "и не перед каждым ответом."
+                ),
+                parameters_json_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Слова или короткая фраза для поиска.",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Количество результатов от 1 до 20.",
+                        },
+                        "before": {
+                            "type": "string",
+                            "description": (
+                                "Необязательно: ISO-дата, например 2026-10-01T00:00:00Z. "
+                                "Показать только сообщения раньше этого момента."
+                            ),
+                        },
+                    },
+                    "required": ["query"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="browse_chat_history",
+                description=(
+                    "Листает историю этого чата по времени: от самых свежих сообщений "
+                    "к более старым. Без before возвращает последние сообщения. "
+                    "Чтобы уйти дальше назад, передай в before значение next_before "
+                    "из прошлого ответа. Сначала смотри свежее, потом глубже. "
+                    "Используй, когда нужно понять, о чём говорили последнее время, "
+                    "и поднять прошлые разговоры по порядку."
+                ),
+                parameters_json_schema={
+                    "type": "object",
+                    "properties": {
+                        "before": {
+                            "type": "string",
+                            "description": (
+                                "Необязательно: next_before из прошлого ответа "
+                                "(ISO-дата). Без него — самые свежие сообщения."
+                            ),
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Сколько сообщений вернуть, от 1 до 50.",
+                        },
+                    },
+                },
+            ),
         ]
 
         if self.stickers:
@@ -513,6 +647,88 @@ class GeminiAgent:
             self._memory_cache.pop(chat_id, None)
 
             return {"saved": True}
+
+        if name == "browse_chat_history":
+            before = args.get("before") or None
+
+            try:
+                limit = int(args.get("limit", 30))
+            except (TypeError, ValueError):
+                limit = 30
+
+            limit = max(1, min(limit, 50))
+
+            try:
+                rows, has_more = await asyncio.to_thread(
+                    self.storage.history_page,
+                    chat_id,
+                    before,
+                    limit,
+                )
+            except Exception:
+                logging.exception(
+                    "Ошибка листания истории чата: chat=%s", chat_id
+                )
+                return {"error": "Не удалось прочитать историю."}
+
+            return {
+                "messages": [
+                    {
+                        "message_id": row.get("message_id"),
+                        "who": row.get("sender_name") or "",
+                        "at": str(row.get("created_at", ""))[:16],
+                        "reply_to": row.get("reply_to_message_id"),
+                        "text": str(row.get("text", ""))[:300],
+                    }
+                    for row in rows
+                ],
+                "count": len(rows),
+                "has_more": has_more,
+                # Самое раннее сообщение страницы: передай его в before, чтобы идти дальше.
+                "next_before": (
+                    rows[0].get("created_at") if rows and has_more else None
+                ),
+            }
+
+        if name == "search_chat_history":
+            query = str(args.get("query", "")).strip()
+
+            if len(query) < 2:
+                return {"error": "Укажи хотя бы два символа или слова."}
+
+            try:
+                limit = int(args.get("limit", 8))
+            except (TypeError, ValueError):
+                limit = 8
+
+            before = args.get("before") or None
+
+            try:
+                rows = await asyncio.to_thread(
+                    self.storage.search_history,
+                    chat_id,
+                    query,
+                    max(1, min(limit, 20)),
+                    before,
+                )
+            except Exception:
+                logging.exception(
+                    "Ошибка поиска по истории чата: chat=%s", chat_id
+                )
+                return {"error": "Не удалось выполнить поиск по истории."}
+
+            return {
+                "messages": [
+                    {
+                        "message_id": row.get("message_id"),
+                        "who": row.get("sender_name") or "",
+                        "at": str(row.get("created_at", ""))[:16],
+                        "text": str(row.get("text", ""))[:500],
+                    }
+                    for row in rows
+                ],
+                "matched": len(rows),
+            }
 
         if name == "search_own_messages":
             query = str(args.get("query", "")).strip()
@@ -841,12 +1057,14 @@ class GeminiAgent:
         branch_messages: list[dict],
         active_branches: list[dict],
         is_stale: Callable[[], bool] | None = None,
+        bot_status: dict | None = None,
     ) -> None:
         core_memories = await self._core_memories(chat_id)
         chat_style = await self._chat_style(chat_id)
 
         # Профиль стиля пересобирается в фоне, сам ответ не ждёт его.
         self.maybe_refresh_style(chat_id)
+        self.maybe_refresh_digest(chat_id)
 
         payload = {
             "chat_id": chat_id,
@@ -855,6 +1073,7 @@ class GeminiAgent:
                 "direct": direct,
                 "branch_id": branch_id,
             },
+            "bot_status": bot_status or {},
             "core_memories": core_memories[:MEMORY_IN_CONTEXT],
             "recent_messages": recent_messages,
             "current_branch_messages": branch_messages,
@@ -883,6 +1102,14 @@ class GeminiAgent:
             "сообщения участников, а не собственные сообщения или сообщения других "
             "ботов. Не ставь реакцию на системные события о входе/выходе участников.\n\n"
 
+            "История чата хранится по времени, и ты можешь её листать. Чтобы вспомнить, "
+            "о чём говорили последнее время, вызови browse_chat_history без before: "
+            "получишь самые свежие сообщения. Если это не та тема, которую ищешь, "
+            "передай next_before из ответа в before и смотри дальше назад, страница за "
+            "страницей. Остановись, когда нашёл нужное или когда has_more равно false. "
+            "Поиск по словам (search_chat_history) используй, только если точно знаешь, "
+            "какое слово или тема нужны.\n\n"
+
             "Долговременная память чата уже в контексте, в поле core_memories. "
             "Это копия из базы, которую система держит в памяти и обновляет сама. "
             "Опирайся на неё без вызова инструментов. Вызывай search_memory только "
@@ -908,7 +1135,15 @@ class GeminiAgent:
             "естественный конкретный повод начать разговор — например, вернуться "
             "к незавершённой теме, задать осмысленный вопрос или поделиться "
             "наблюдением. Не заполняй тишину банальным «как дела?» и не выдумывай "
-            "новости или личные события. Если повода нет, промолчи.\n\n"
+            "новости или личные события. Повод часто лежит в core_memories: незакрытая "
+            "тема, обещание, внутренняя шутка. Если нашёл такой повод, начинай разговор "
+            "охотнее. Если повода нет, промолчи.\n\n"
+
+            "Если trigger.reason равен bot_added, тебя только что добавили в этот чат. "
+            "Кто добавил, видно в истории по событию [СОБЫТИЕ ЧАТА] и в bot_status. "
+            "Можешь коротко и в своём духе отреагировать или представиться, а можешь "
+            "промолчать. Если в истории видно, что тебя уже удаляли, учти это. "
+            "Если bot_status.status равен removed, ты не в чате и писать не можешь.\n\n"
 
             "Если trigger.reason связан с member_joined, member_left или "
             "membership_changed, учти событие входа/выхода участника. Не обязан "
@@ -1000,3 +1235,104 @@ class GeminiAgent:
             # генерировать ещё одну реплику.
             if performed_chat_action:
                 return
+
+    def maybe_refresh_digest(self, chat_id: int) -> None:
+        """Иногда запускает фоновый дайджест. Не блокирует ответ."""
+        now = time.monotonic()
+        last = self._digest_checked_at.get(chat_id, 0.0)
+
+        if now - last < DIGEST_CHECK_INTERVAL_SECONDS:
+            return
+
+        self._digest_checked_at[chat_id] = now
+
+        if chat_id in self._digest_running:
+            return
+
+        task = asyncio.create_task(self.refresh_chat_digest(chat_id))
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    async def refresh_chat_digest(self, chat_id: int) -> None:
+        """Превращает свежую переписку в долговременные воспоминания чата."""
+        if chat_id in self._digest_running:
+            return
+
+        self._digest_running.add(chat_id)
+
+        try:
+            state = await asyncio.to_thread(
+                self.storage.get_digest_state,
+                chat_id,
+            )
+
+            observed = int(state.get("observed", 0))
+            digested = int(state.get("digested", 0))
+
+            if observed - digested < DIGEST_EVERY_MESSAGES:
+                return
+
+            messages = await asyncio.to_thread(
+                self.storage.recent_messages,
+                chat_id,
+                DIGEST_SAMPLE_SIZE,
+            )
+
+            sample = [
+                {
+                    "who": (
+                        "Мембу"
+                        if m.get("sender_name") == "Мембу"
+                        else (m.get("sender_name") or "участник")
+                    ),
+                    "text": str(m.get("text", ""))[:400],
+                }
+                for m in messages
+            ]
+
+            response = await asyncio.to_thread(
+                self.client.models.generate_content,
+                model=self.model,
+                contents=(
+                    "Переписка (json):\n"
+                    + json.dumps(sample, ensure_ascii=False)
+                ),
+                config=types.GenerateContentConfig(
+                    system_instruction=DIGEST_INSTRUCTION,
+                    temperature=0.3,
+                    max_output_tokens=1500,
+                ),
+            )
+
+            items = parse_digest_items(response.text or "")
+
+            for item in items:
+                await asyncio.to_thread(
+                    self.storage.save_memory,
+                    chat_id,
+                    item["category"],
+                    item["content"],
+                    item["importance"],
+                    item["people"],
+                )
+
+            if items:
+                self._memory_cache.pop(chat_id, None)
+
+            await asyncio.to_thread(
+                self.storage.mark_digested,
+                chat_id,
+                observed,
+            )
+
+            logging.info(
+                "MEMBU_DIGEST | chat=%s | saved=%s",
+                chat_id,
+                len(items),
+            )
+
+        except Exception:
+            logging.exception("Ошибка дайджеста памяти чата %s", chat_id)
+
+        finally:
+            self._digest_running.discard(chat_id)

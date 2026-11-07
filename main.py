@@ -10,7 +10,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
-from aiogram.types import Message, User
+from aiogram.types import ChatMemberUpdated, Message, User
 
 from membu import MembuCore
 from storage import MembuStorage
@@ -47,15 +47,18 @@ BRANCH_TTL = int(
 # Через сколько тишины Мембу получит возможность самому начать разговор.
 IDLE_INITIATIVE_SECONDS = max(
     60,
-    int(os.getenv("MEMBU_IDLE_SECONDS", "1200")),
+    int(os.getenv("MEMBU_IDLE_SECONDS", "600")),
 )
 
 # Даже если чат продолжает молчать, повторно предлагать инициативу
 # Gemini будет не чаще одного раза за этот промежуток.
 IDLE_INITIATIVE_COOLDOWN_SECONDS = max(
     IDLE_INITIATIVE_SECONDS,
-    int(os.getenv("MEMBU_IDLE_COOLDOWN_SECONDS", "3600")),
+    int(os.getenv("MEMBU_IDLE_COOLDOWN_SECONDS", "1800")),
 )
+
+# Статус самого Мембу в каждом чате: in_chat или removed, кто и когда.
+BOT_IN_CHAT_STATUSES = {"member", "administrator", "creator"}
 
 # Telegram показывает typing максимум 5 секунд. Обновляем чаще этого срока.
 TYPING_REFRESH_SECONDS = 4.0
@@ -88,6 +91,9 @@ bot: Bot | None = None
 
 # Ключ: (chat_id, user_id). У каждого пользователя свой таймер задержки.
 pending_triggers: dict[tuple[int, int], PendingTrigger] = {}
+
+# Статус Мембу в чатах, чтобы модель знала, что с ним происходило.
+chat_bot_status: dict[int, dict] = {}
 
 # Очередь и воркер на каждый чат: ответы идут по очереди, без отмены друг друга.
 chat_queues: dict[int, asyncio.Queue] = {}
@@ -256,6 +262,13 @@ async def run_agent_with_context(
     typing_task = asyncio.create_task(typing_indicator(chat_id))
 
     try:
+        # После перезапуска статус берём из истории, а не ждём нового события.
+        if chat_id not in chat_bot_status:
+            chat_bot_status[chat_id] = await asyncio.to_thread(
+                storage.last_bot_membership,
+                chat_id,
+            )
+
         recent = await asyncio.to_thread(
             storage.recent_messages,
             chat_id,
@@ -302,6 +315,7 @@ async def run_agent_with_context(
             branch_messages=branch_messages,
             active_branches=active_branches,
             is_stale=is_stale,
+            bot_status=chat_bot_status.get(chat_id),
         )
 
     finally:
@@ -449,6 +463,80 @@ async def idle_initiative_monitor(chat_id: int) -> None:
 
 def _activity_changed(chat_id: int, version: int) -> bool:
     return version != chat_user_activity_version.get(chat_id, 0)
+
+
+@router.my_chat_member()
+async def handle_bot_membership(update: ChatMemberUpdated) -> None:
+    """Замечает, что Мембу добавили в чат или удалили из него."""
+    if storage is None or bot_user is None:
+        return
+
+    if update.chat.type not in {"group", "supergroup"}:
+        return
+
+    chat_id = update.chat.id
+    was_in = update.old_chat_member.status in BOT_IN_CHAT_STATUSES
+    is_in = update.new_chat_member.status in BOT_IN_CHAT_STATUSES
+
+    if was_in == is_in:
+        return
+
+    actor = update.from_user
+    actor_name = format_member(actor) if actor else "неизвестно кто"
+    changed_at = update.date.isoformat()
+
+    if is_in:
+        reason = "bot_added"
+        text = f"[СОБЫТИЕ ЧАТА] Мембу добавили в чат; добавил: {actor_name}"
+        chat_bot_status[chat_id] = {
+            "status": "in_chat",
+            "changed_at": changed_at,
+            "by": actor_name,
+        }
+        register_group_activity(chat_id)
+    else:
+        reason = "bot_removed"
+        self_left = actor is None or actor.id == bot_user.id
+        who = "сам вышел" if self_left else f"удалил: {actor_name}"
+        text = f"[СОБЫТИЕ ЧАТА] Мембу удалили из чата ({who})"
+        chat_bot_status[chat_id] = {
+            "status": "removed",
+            "changed_at": changed_at,
+            "by": actor_name,
+        }
+
+    # У этого события нет message_id. Берём отрицательный ключ из времени,
+    # он не пересекается с обычными сообщениями Telegram (их ID положительные).
+    synthetic_id = -int(update.date.timestamp() * 1000)
+
+    await asyncio.to_thread(
+        storage.add_message,
+        {
+            "chat_id": chat_id,
+            "message_id": synthetic_id,
+            "sender_id": actor.id if actor else None,
+            "sender_name": actor.full_name if actor else "Telegram",
+            "username": (actor.username or "") if actor else "",
+            "text": text,
+            "reply_to_user_id": None,
+            "reply_to_message_id": None,
+            "branch_id": None,
+            "ts": update.date.timestamp(),
+        },
+    )
+
+    logging.info("MEMBU | chat=%s | bot_membership=%s | %s", chat_id, reason, text)
+
+    # Удалённого Мембу ответ не может достичь: писать ему некуда, поэтому ИИ
+    # вызываем только при добавлении.
+    if reason == "bot_added":
+        schedule_agent(
+            chat_id=chat_id,
+            branch_id=None,
+            reason=reason,
+            direct=False,
+            sender_id=actor.id if actor else 0,
+        )
 
 
 @router.message(Command("privacy"))
@@ -743,8 +831,9 @@ async def main() -> None:
             IDLE_INITIATIVE_COOLDOWN_SECONDS,
         )
 
+        # Не сбрасываем сообщения, пришедшие во время простоя или деплоя.
         await bot.delete_webhook(
-            drop_pending_updates=True,
+            drop_pending_updates=False,
         )
 
         await dp.start_polling(

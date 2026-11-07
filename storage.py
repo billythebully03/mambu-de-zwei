@@ -291,3 +291,113 @@ class MembuStorage:
             .execute()
         )
         return result.data or []
+
+    def search_history(
+        self,
+        chat_id: int,
+        query: str,
+        limit: int = 8,
+        before: str | None = None,
+    ) -> list[dict]:
+        """Поиск по всей истории чата (люди и Мембу) с учётом окончаний слов."""
+        params = {
+            "p_chat_id": chat_id,
+            "p_query": query,
+            "p_limit": max(1, min(limit, 20)),
+            "p_before": before,
+        }
+        result = self.client.rpc("search_membu_history", params).execute()
+        return result.data or []
+
+    def get_digest_state(self, chat_id: int) -> dict:
+        """Сколько сообщений чата накопилось и сколько уже вошло в дайджест."""
+        result = (
+            self.client.table("membu_chat_profiles")
+            .select("observed_messages,last_digested_count")
+            .eq("chat_id", chat_id)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            return {"observed": 0, "digested": 0}
+        return {
+            "observed": int(rows[0].get("observed_messages") or 0),
+            "digested": int(rows[0].get("last_digested_count") or 0),
+        }
+
+    def mark_digested(self, chat_id: int, observed: int) -> None:
+        self.client.table("membu_chat_profiles").update(
+            {"last_digested_count": observed}
+        ).eq("chat_id", chat_id).execute()
+
+    def history_page(
+        self,
+        chat_id: int,
+        before: str | None = None,
+        limit: int = 30,
+    ) -> tuple[list[dict], bool]:
+        """Страница истории по времени, от новых к старым.
+
+        Возвращает сообщения в хронологическом порядке и признак,
+        есть ли более ранние сообщения.
+        """
+        query = (
+            self.client.table("membu_messages")
+            .select(
+                "message_id,sender_name,text,created_at,"
+                "reply_to_message_id,branch_id"
+            )
+            .eq("chat_id", chat_id)
+        )
+
+        if before:
+            query = query.lt("created_at", before)
+
+        rows = (
+            query.order("created_at", desc=True)
+            .limit(limit + 1)
+            .execute()
+            .data
+            or []
+        )
+
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        return list(reversed(rows)), has_more
+
+    def last_bot_membership(self, chat_id: int) -> dict:
+        """Последнее событие добавления или удаления Мембу из истории чата.
+
+        Нужно, чтобы после перезапуска бот знал свой статус без новых событий.
+        """
+        result = (
+            self.client.table("membu_messages")
+            .select("text,created_at")
+            .eq("chat_id", chat_id)
+            .like("text", "[СОБЫТИЕ ЧАТА] Мембу%")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            return {}
+
+        text = str(rows[0].get("text", ""))
+        changed_at = str(rows[0].get("created_at", ""))
+
+        if "добавили в чат" in text:
+            status = "in_chat"
+        elif "удалили из чата" in text:
+            status = "removed"
+        else:
+            return {}
+
+        by = ""
+        for marker in ("добавил: ", "удалил: "):
+            if marker in text:
+                by = text.split(marker, 1)[1].rstrip(")")
+                break
+
+        return {"status": status, "changed_at": changed_at, "by": by}
