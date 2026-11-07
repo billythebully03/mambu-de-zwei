@@ -114,6 +114,55 @@ def background_memories(
     return out
 
 
+def _parse_ts(value) -> datetime | None:
+    try:
+        ts = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+
+def active_burst(messages: list[dict], now: datetime) -> dict | None:
+    """Если человек пишет серией коротких сообщений подряд, возвращает её описание.
+    Тогда он, скорее всего, ещё не закончил мысль."""
+    rows = []
+    for m in messages:
+        ts = _parse_ts(m.get("created_at"))
+        if ts:
+            rows.append((ts, m))
+
+    if len(rows) < 2:
+        return None
+
+    rows.sort(key=lambda item: item[0])
+    last_ts, last = rows[-1]
+
+    if (now - last_ts).total_seconds() > 30:
+        return None
+
+    sender = last.get("sender_id") or last.get("sender_name")
+    count = 0
+    prev_ts = None
+
+    for ts, m in reversed(rows):
+        who = m.get("sender_id") or m.get("sender_name")
+        if who != sender:
+            break
+        if prev_ts and (prev_ts - ts).total_seconds() > 25:
+            break
+        count += 1
+        prev_ts = ts
+
+    if count < 2:
+        return None
+
+    return {
+        "sender_name": last.get("sender_name") or "участник",
+        "messages": count,
+        "last_message_seconds_ago": round((now - last_ts).total_seconds(), 1),
+    }
+
+
 def trim_own_messages(messages: list[dict], keep: int = 3) -> list[dict]:
     """Оставляет в контексте только последние реплики самого Мембу, чтобы он не
     продолжал свою прошлую шутку или тему по инерции."""
@@ -1281,6 +1330,7 @@ class GeminiAgent:
                 for m in trim_own_messages(recent_messages, keep=3)
             ],
             "current_branch_messages": branch_messages,
+            "active_burst": active_burst(recent_messages, datetime.now(timezone.utc)),
             "active_branches": active_branches,
             "chat_style": chat_style,
         }
@@ -1296,6 +1346,12 @@ class GeminiAgent:
             "следующее сообщение должно добавлять что-то новое. Ответом можно сослаться на любое "
             "сообщение (в том числе из истории или recalled_history, по message_id), на своё "
             "сообщение или не сослаться вовсе.\n\n"
+
+            "Поток мыслей: если в payload есть active_burst, человек, скорее всего, пишет "
+            "несколькими сообщениями подряд. Не отвечай на первую часть. Если мысль явно не "
+            "закончена (обрывается, «и», «а», «короче», многоточие), промолчи и дождись "
+            "следующих сообщений. Если решил ответить, учитывай весь поток целиком. Дополнить "
+            "можно отдельным сообщением, если это действительно добавляет.\n\n"
 
             "Настрой чата: если люди желают друг другу доброго утра, спокойной ночи или "
             "сладких снов, можешь подключиться тепло и коротко, в тон. Не обязан.\n\n"
