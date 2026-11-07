@@ -1,3 +1,4 @@
+
 import asyncio
 import json
 import logging
@@ -14,8 +15,13 @@ from google.genai import types
 
 
 MEMORY_CATEGORIES = [
-    "profile", "preference", "relationship", "ongoing",
-    "event", "inside_joke", "opinion",
+    "profile",
+    "preference",
+    "relationship",
+    "ongoing",
+    "event",
+    "inside_joke",
+    "opinion",
 ]
 
 TELEGRAM_REACTIONS = [
@@ -83,6 +89,14 @@ class GeminiAgent:
             base_dir / "stickers.json"
         )
 
+        # Gemini видит нейтральные номера, а не названия вроде
+        # fish_market или stop_messing_with_me.
+        # Реальные ключи остаются внутри приложения.
+        self.sticker_alias_to_key = {
+            f"sticker_{index:02d}": key
+            for index, key in enumerate(self.stickers, start=1)
+        }
+
         self.tools = self._build_tools()
 
         self.config = types.GenerateContentConfig(
@@ -94,11 +108,13 @@ class GeminiAgent:
 
         if self.backup_client:
             logging.info(
-                "Gemini резервный ключ настроен; переключение будет выполняться при 429/RESOURCE_EXHAUSTED"
+                "Gemini резервный ключ настроен; "
+                "переключение будет выполняться при 429/RESOURCE_EXHAUSTED"
             )
         else:
             logging.warning(
-                "GEMINI_BACKUP_API_KEY не задан; резервное переключение Gemini отключено"
+                "GEMINI_BACKUP_API_KEY не задан; "
+                "резервное переключение Gemini отключено"
             )
 
     # =========================================
@@ -111,17 +127,18 @@ class GeminiAgent:
         if not self.backup_client:
             return
 
-        if self._quota_monitor_task is None or self._quota_monitor_task.done():
+        if (
+            self._quota_monitor_task is None
+            or self._quota_monitor_task.done()
+        ):
             self._quota_monitor_task = asyncio.create_task(
                 self._quota_watchdog()
             )
 
     async def _quota_watchdog(self) -> None:
         """
-        Каждые две секунды проверяет, закончилась ли пауза основного ключа.
-
-        Не отправляет тестовые запросы к Gemini и не расходует квоту.
-        Реальное исчерпание лимита определяется по ответу 429 API.
+        Проверяет окончание паузы основного ключа.
+        Не отправляет тестовые запросы и не расходует квоту.
         """
 
         while True:
@@ -139,7 +156,8 @@ class GeminiAgent:
                 self._primary_retry_at = 0.0
 
                 logging.info(
-                    "Gemini: пауза основного ключа завершилась; следующий запрос проверит его доступность"
+                    "Gemini: пауза основного ключа завершилась; "
+                    "следующий запрос проверит его доступность"
                 )
 
     @staticmethod
@@ -199,12 +217,13 @@ class GeminiAgent:
                                 ),
                             )
 
-                # Суточная квота обычно не восстановится через минуту.
                 for item in error_data.get("details", []) or []:
                     if not isinstance(item, dict):
                         continue
 
-                    if not str(item.get("@type", "")).endswith("QuotaFailure"):
+                    if not str(item.get("@type", "")).endswith(
+                        "QuotaFailure"
+                    ):
                         continue
 
                     for violation in item.get("violations", []) or []:
@@ -212,7 +231,10 @@ class GeminiAgent:
                             violation.get("quotaId", "")
                         ).lower()
 
-                        if "perday" in quota_id or "per_day" in quota_id:
+                        if (
+                            "perday" in quota_id
+                            or "per_day" in quota_id
+                        ):
                             return 6 * 60 * 60
 
         match = re.search(
@@ -240,7 +262,10 @@ class GeminiAgent:
         переключается на резервный и повторяет тот же запрос один раз.
         """
 
-        if self._active_key_name == "backup" and self.backup_client:
+        if (
+            self._active_key_name == "backup"
+            and self.backup_client
+        ):
             selected_client = self.backup_client
             selected_name = "backup"
         else:
@@ -271,7 +296,8 @@ class GeminiAgent:
             )
 
             logging.warning(
-                "Gemini: основной ключ получил квоту/429; переключаюсь на резервный на %.0f сек. Ошибка: %s",
+                "Gemini: основной ключ получил квоту/429; "
+                "переключаюсь на резервный на %.0f сек. Ошибка: %s",
                 cooldown,
                 str(exc)[:350],
             )
@@ -284,7 +310,9 @@ class GeminiAgent:
 
             except Exception:
                 logging.exception(
-                    "Gemini: резервный ключ тоже не смог выполнить запрос. Проверь, что он относится к другому проекту и имеет доступ к модели."
+                    "Gemini: резервный ключ тоже не смог выполнить запрос. "
+                    "Проверь, что он относится к другому проекту "
+                    "и имеет доступ к модели."
                 )
                 raise
 
@@ -330,7 +358,8 @@ class GeminiAgent:
             )
         except FileNotFoundError:
             logging.warning(
-                "Файл stickers.json не найден; отправка стикеров отключена"
+                "Файл stickers.json не найден; "
+                "отправка стикеров отключена"
             )
             return {}
         except (OSError, json.JSONDecodeError) as exc:
@@ -355,7 +384,10 @@ class GeminiAgent:
         catalog = {}
 
         for item in entries:
-            if not isinstance(item, dict) or item.get("enabled", True) is False:
+            if (
+                not isinstance(item, dict)
+                or item.get("enabled", True) is False
+            ):
                 continue
 
             key = str(item.get("key", "")).strip()
@@ -367,13 +399,27 @@ class GeminiAgent:
             catalog[key] = {
                 "key": key,
                 "file_id": file_id,
-                "description": str(item.get("description", "")).strip(),
-                "meaning": str(item.get("meaning", "")).strip(),
-                "usage": str(item.get("usage", "")).strip(),
-                "format": str(item.get("format", "static")).strip(),
-                "emoji": str(item.get("emoji", "")).strip(),
-                "set_name": str(item.get("set_name", "")).strip(),
-                "file_unique_id": str(item.get("file_unique_id", "")).strip(),
+                "description": str(
+                    item.get("description", "")
+                ).strip(),
+                "meaning": str(
+                    item.get("meaning", "")
+                ).strip(),
+                "usage": str(
+                    item.get("usage", "")
+                ).strip(),
+                "format": str(
+                    item.get("format", "static")
+                ).strip(),
+                "emoji": str(
+                    item.get("emoji", "")
+                ).strip(),
+                "set_name": str(
+                    item.get("set_name", "")
+                ).strip(),
+                "file_unique_id": str(
+                    item.get("file_unique_id", "")
+                ).strip(),
             }
 
         logging.info(
@@ -384,14 +430,47 @@ class GeminiAgent:
         return catalog
 
     def _sticker_catalog_for_model(self) -> str:
+        """
+        Показывает Gemini назначение стикеров, но не их подписи.
+
+        Описание картинки не должно становиться темой разговора.
+        Для выбора важна коммуникативная функция: интонация,
+        настроение и ситуация, в которой стикер уместен.
+        """
+
         if not self.stickers:
             return "Сейчас доступных стикеров нет."
 
-        return "\n".join(
-            f"{key}: {item['description']} Значение: {item['meaning']} "
-            f"Когда уместен: {item['usage']}"
-            for key, item in self.stickers.items()
-        )
+        lines = []
+
+        for alias, real_key in self.sticker_alias_to_key.items():
+            sticker = self.stickers[real_key]
+
+            meaning = sticker.get("meaning") or ""
+            usage = sticker.get("usage") or ""
+
+            parts = []
+
+            if meaning:
+                parts.append(
+                    f"Интонация: {meaning}"
+                )
+
+            if usage:
+                parts.append(
+                    f"Когда уместен: {usage}"
+                )
+
+            if not parts:
+                parts.append(
+                    "Используй только если стикер естественно подходит ситуации."
+                )
+
+            lines.append(
+                f"{alias}: " + " ".join(parts)
+            )
+
+        return "\n".join(lines)
 
     # =========================================
     # ИНСТРУМЕНТЫ GEMINI
@@ -403,9 +482,9 @@ class GeminiAgent:
                 name="search_memory",
                 description=(
                     "Ищет воспоминания Мембу о людях, событиях, отношениях, "
-                    "предпочтениях и прошлых разговорах. Используй только если "
-                    "старый контекст действительно нужен. Не вызывай автоматически "
-                    "перед каждым ответом."
+                    "предпочтениях и прошлых разговорах. Используй, когда "
+                    "старый контекст действительно нужен. Не вызывай "
+                    "автоматически перед каждым ответом."
                 ),
                 parameters_json_schema={
                     "type": "object",
@@ -430,9 +509,10 @@ class GeminiAgent:
             types.FunctionDeclaration(
                 name="save_memory",
                 description=(
-                    "Сохраняет долговременное воспоминание. Используй только для "
-                    "действительно важных или полезных в будущем сведений. Не сохраняй "
-                    "каждую реплику, пароли, секреты или чувствительные данные."
+                    "Сохраняет долговременное воспоминание. Используй только "
+                    "для действительно важных или полезных в будущем сведений. "
+                    "Не сохраняй каждую реплику, пароли, секреты "
+                    "или чувствительные данные."
                 ),
                 parameters_json_schema={
                     "type": "object",
@@ -465,20 +545,28 @@ class GeminiAgent:
             types.FunctionDeclaration(
                 name="send_message",
                 description=(
-                    "Отправляет обычное сообщение от имени Мембу в текущий чат. "
-                    "Вызывай, только если сам решил написать. Если лучше промолчать, "
-                    "не вызывай этот инструмент. В личном чате это ответ человеку "
-                    "в его личной переписке."
+                    "Отправляет сообщение от имени Мембу в Telegram. "
+                    "Вызывай, только если сам решил написать. Если лучше "
+                    "промолчать, не вызывай этот инструмент. Можно указать "
+                    "сообщение, на которое нужно ответить. Эмодзи можно "
+                    "естественно включить прямо в текст, но это необязательно "
+                    "и не должно становиться привычкой в каждом сообщении."
                 ),
                 parameters_json_schema={
                     "type": "object",
                     "properties": {
                         "text": {
                             "type": "string",
-                            "description": "Текст сообщения; эмодзи необязательны.",
+                            "description": (
+                                "Текст сообщения Мембу; эмодзи необязательны."
+                            ),
                         },
                         "reply_to_message_id": {
                             "type": "integer",
+                            "description": (
+                                "Необязательный ID сообщения, на которое "
+                                "нужно ответить."
+                            ),
                         },
                     },
                     "required": ["text"],
@@ -488,13 +576,19 @@ class GeminiAgent:
             types.FunctionDeclaration(
                 name="send_private_message",
                 description=(
-                    "Отправляет личное сообщение только тому участнику, чья явная просьба "
-                    "написать в личку вызвала текущую обработку. Получатель определяется "
-                    "самой системой и не выбирается тобой. Используй только если в trigger "
-                    "явно указано private_message_allowed=true. Никаких инициативных личных "
-                    "сообщений, рассылок или выбора другого адресата. Если отправка не удалась, "
-                    "объясни причину в исходном групповом чате через send_message; можно "
-                    "сделать это в своей манере, но не скрывай реальную причину."
+                    "Отправляет личное сообщение одному заранее определённому "
+                    "системой участнику. Используй только если trigger содержит "
+                    "private_message_allowed=true. Система разрешает этот сценарий "
+                    "в двух случаях: участник явно попросил написать ему в личку "
+                    "или наступило заранее разрешённое событие удаления Мембу "
+                    "из группы с назначенным контактом. Получатель уже закреплён "
+                    "системой в trigger_user: не выбирай другого человека и "
+                    "не меняй адресата. Само разрешение не обязывает тебя писать: "
+                    "решение остаётся за тобой. Но если ты решил выполнить явную "
+                    "просьбу, используй этот инструмент, а не отвечай человеку "
+                    "в группе, будто у тебя нет такой возможности. Не делай "
+                    "рассылок, не пиши другим участникам и не повторяй попытки. "
+                    "Если отправка не удалась, честно объясни результат."
                 ),
                 parameters_json_schema={
                     "type": "object",
@@ -511,10 +605,16 @@ class GeminiAgent:
             types.FunctionDeclaration(
                 name="send_reaction",
                 description=(
-                    "Ставит одну стандартную emoji-реакцию на существующее сообщение. "
-                    "Используй, когда реакции достаточно. message_id выбирай только из "
-                    "переданного контекста; не выдумывай идентификаторы. Не реагируй на "
-                    "сервисные сообщения о входе/выходе участников. Допустимые значения: "
+                    "Ставит одну стандартную emoji-реакцию на существующее "
+                    "сообщение. Это полноценный способ ответить вместо текста. "
+                    "Используй, когда реакции достаточно, когда участник прямо "
+                    "просит её поставить или когда реакция естественно дополняет "
+                    "разговор. Не реагируй на всё подряд. message_id выбирай "
+                    "только из переданного контекста; не выдумывай идентификаторы. "
+                    "Предпочитай сообщения участников, а не собственные сообщения "
+                    "или сообщения других ботов, если тебя специально не попросили "
+                    "об обратном. Не пытайся реагировать на сервисные сообщения "
+                    "о входе/выходе участников. Допустимые значения: "
                     + ", ".join(TELEGRAM_REACTIONS)
                 ),
                 parameters_json_schema={
@@ -538,10 +638,11 @@ class GeminiAgent:
             types.FunctionDeclaration(
                 name="update_chat_style",
                 description=(
-                    "Обновляет компактный профиль общей манеры общения этого чата. "
-                    f"Вызывай только если накопилось не меньше {MIN_MESSAGES_FOR_STYLE_UPDATE} "
-                    "новых сообщений и видны устойчивые повторяющиеся особенности. "
-                    "Передавай полный профиль. Не сохраняй личные секреты, индивидуальные "
+                    "Обновляет компактный профиль общей манеры общения этого "
+                    "чата. Вызывай только если накопилось не меньше "
+                    f"{MIN_MESSAGES_FOR_STYLE_UPDATE} новых сообщений и видны "
+                    "устойчивые повторяющиеся особенности. Передавай полный "
+                    "профиль. Не сохраняй личные секреты, индивидуальные "
                     "характеристики участников или случайную разовую шутку."
                 ),
                 parameters_json_schema={
@@ -559,10 +660,11 @@ class GeminiAgent:
             types.FunctionDeclaration(
                 name="search_own_messages",
                 description=(
-                    "Ищет старые текстовые сообщения, которые сам Мембу отправлял "
-                    "в текущем чате. Используй, чтобы проверить, что говорил раньше, "
-                    "найти собственное обещание или вернуться к теме. Поиск буквальный, "
-                    "по словам и фразе. Не вызывай перед каждым ответом."
+                    "Ищет старые текстовые сообщения, которые сам Мембу "
+                    "отправлял в текущем чате. Используй, чтобы проверить, "
+                    "что говорил раньше, найти собственное обещание или "
+                    "вернуться к теме. Поиск буквальный, по словам и фразе. "
+                    "Не вызывай перед каждым ответом."
                 ),
                 parameters_json_schema={
                     "type": "object",
@@ -581,13 +683,16 @@ class GeminiAgent:
             types.FunctionDeclaration(
                 name="edit_own_message",
                 description=(
-                    "Крайне редко редактирует одно собственное текстовое сообщение Мембу. "
-                    "Только при существенной фактической ошибке, вводящей в заблуждение "
-                    "формулировке или пропущенной важной детали. Не переписывай шутки, "
-                    "стиль и обычные формулировки ради красоты. Только одно редактирование "
-                    "сообщения в течение 10 минут; не чаще одной правки за 5 минут и трёх "
-                    "за час на весь чат. message_id должен быть из контекста или поиска. "
-                    "Нельзя менять чужие сообщения или стикеры. Укажи содержательную причину."
+                    "Крайне редко редактирует одно собственное текстовое "
+                    "сообщение Мембу. Только при существенной фактической "
+                    "ошибке, вводящей в заблуждение формулировке или "
+                    "пропущенной важной детали. Не переписывай шутки, стиль "
+                    "и обычные формулировки ради красоты. Только одно "
+                    "редактирование сообщения в течение 10 минут; не чаще "
+                    "одной правки за 5 минут и трёх за час на весь чат. "
+                    "message_id должен быть из контекста или поиска. Нельзя "
+                    "менять чужие сообщения или стикеры. Укажи содержательную "
+                    "причину. Если сомневаешься — оставь исходное сообщение."
                 ),
                 parameters_json_schema={
                     "type": "object",
@@ -616,10 +721,20 @@ class GeminiAgent:
                 types.FunctionDeclaration(
                     name="send_sticker",
                     description=(
-                        "Отправляет один стикер из личного каталога Мембу. Это может быть "
-                        "самостоятельная реплика. Используй редко и только когда стикер "
-                        "точно подходит. Обычно выбери либо текст, либо стикер, либо реакцию. "
-                        "Не дублируй один смысл текстом и стикером. Каталог:\n"
+                        "Отправляет один стикер из личного каталога Мембу. "
+                        "Это может быть полноценная реплика вместо текста, "
+                        "короткая невербальная реакция или дополнение к сообщению. "
+                        "Используй редко и естественно, когда стикер действительно "
+                        "передаёт нужную интонацию. Не отправляй его просто для "
+                        "украшения сообщения. Не нужно искать буквальное совпадение "
+                        "между изображением стикера и предметом разговора. "
+                        "Каталог содержит подсказки о коммуникативной функции "
+                        "стикера, а не готовые фразы для произнесения. Не обсуждай "
+                        "подписи, названия или описания стикеров и не превращай "
+                        "их в тему разговора. Обычно выбери либо текст, либо "
+                        "стикер, либо реакцию, но можешь сочетать разные способы, "
+                        "когда каждый из них добавляет самостоятельный смысл. "
+                        "Каталог:\n"
                         + self._sticker_catalog_for_model()
                     ),
                     parameters_json_schema={
@@ -627,7 +742,10 @@ class GeminiAgent:
                         "properties": {
                             "key": {
                                 "type": "string",
-                                "enum": list(self.stickers),
+                                "enum": list(self.sticker_alias_to_key),
+                                "description": (
+                                    "Нейтральный номер стикера из каталога."
+                                ),
                             },
                             "reply_to_message_id": {
                                 "type": "integer",
@@ -641,6 +759,10 @@ class GeminiAgent:
         return types.Tool(
             function_declarations=declarations
         )
+
+    # =========================================
+    # ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
+    # =========================================
 
     def _mark_chat_activity(self, chat_id: int) -> None:
         if self.activity_callback is None:
@@ -678,6 +800,63 @@ class GeminiAgent:
             result = result.replace(tzinfo=timezone.utc)
 
         return result.astimezone(timezone.utc)
+
+    def _sanitize_context_messages(
+        self,
+        messages: list[dict] | None,
+    ) -> list[dict]:
+        """
+        Очищает историю для Gemini от старых текстовых описаний
+        отправленных Мембу стикеров.
+
+        В Supabase ничего не меняется. Старые записи вроде
+        [СТИКЕР: fish_market] ...Значение: ... заменяются
+        нейтральной записью о том, что Мембу отправил стикер.
+        """
+
+        sanitized = []
+
+        for message in messages or []:
+            if not isinstance(message, dict):
+                continue
+
+            item = dict(message)
+
+            sender_id = str(item.get("sender_id", ""))
+            own_sender = sender_id == str(self.bot_user.id)
+
+            text_value = str(item.get("text") or "")
+
+            if (
+                own_sender
+                and text_value.startswith("[СТИКЕР:")
+            ):
+                item["text"] = "[МЕМБУ ОТПРАВИЛ СТИКЕР]"
+
+            sanitized.append(item)
+
+        return sanitized
+
+    def _sanitize_active_branches(
+        self,
+        branches: list[dict] | None,
+    ) -> list[dict]:
+        sanitized = []
+
+        for branch in branches or []:
+            if not isinstance(branch, dict):
+                continue
+
+            item = dict(branch)
+
+            if isinstance(item.get("messages"), list):
+                item["messages"] = self._sanitize_context_messages(
+                    item["messages"]
+                )
+
+            sanitized.append(item)
+
+        return sanitized
 
     # =========================================
     # СОХРАНЕНИЕ ОТПРАВЛЕННЫХ СООБЩЕНИЙ
@@ -726,14 +905,27 @@ class GeminiAgent:
         requester: dict | None,
         allowed: bool,
     ) -> dict:
-        if not allowed or not requester or not requester.get("user_id"):
+        if (
+            not allowed
+            or not requester
+            or not requester.get("user_id")
+        ):
             return {
                 "sent": False,
                 "reason": "not_explicitly_requested",
-                "error": "Личное сообщение не разрешено для этого события.",
+                "error": (
+                    "Личное сообщение не разрешено для этого события."
+                ),
             }
 
-        user_id = int(requester["user_id"])
+        try:
+            user_id = int(requester["user_id"])
+        except (TypeError, ValueError):
+            return {
+                "sent": False,
+                "reason": "invalid_recipient",
+                "error": "Не удалось определить получателя личного сообщения.",
+            }
 
         if not await asyncio.to_thread(
             self.storage.has_private_chat_opt_in,
@@ -750,7 +942,10 @@ class GeminiAgent:
             return {
                 "sent": False,
                 "reason": "user_has_not_started_private_chat",
-                "error": "Пользователь ещё не открыл личный чат с Мембу и не нажал Start.",
+                "error": (
+                    "Пользователь ещё не открыл личный чат с Мембу "
+                    "и не нажал Start."
+                ),
                 "start_link": start_link,
             }
 
@@ -789,7 +984,8 @@ class GeminiAgent:
         except Exception:
             history_saved = False
             logging.exception(
-                "Личное сообщение отправлено, но не записано в Supabase: user=%s",
+                "Личное сообщение отправлено, но не записано "
+                "в Supabase: user=%s",
                 user_id,
             )
 
@@ -843,7 +1039,10 @@ class GeminiAgent:
         if len(reason) < 12:
             return {
                 "edited": False,
-                "error": "Укажи содержательную причину, а не косметическое улучшение.",
+                "error": (
+                    "Укажи содержательную причину, "
+                    "а не косметическое улучшение."
+                ),
             }
 
         reason = reason[:300]
@@ -881,15 +1080,24 @@ class GeminiAgent:
             if not message:
                 return {
                     "edited": False,
-                    "error": "Сообщение не найдено среди собственных сообщений Мембу.",
+                    "error": (
+                        "Сообщение не найдено среди собственных "
+                        "сообщений Мембу."
+                    ),
                 }
 
             old_text = str(message.get("text", ""))
 
-            if old_text.startswith("[СТИКЕР:") or old_text.startswith("[ВЛОЖЕНИЕ:"):
+            if (
+                old_text.startswith("[СТИКЕР:")
+                or old_text.startswith("[ВЛОЖЕНИЕ:")
+            ):
                 return {
                     "edited": False,
-                    "error": "Медиа и стикеры этим инструментом редактировать нельзя.",
+                    "error": (
+                        "Медиа и стикеры этим инструментом "
+                        "редактировать нельзя."
+                    ),
                 }
 
             created_at = self._parse_datetime(
@@ -909,7 +1117,10 @@ class GeminiAgent:
             if age < -60 or age > EDIT_WINDOW_SECONDS:
                 return {
                     "edited": False,
-                    "error": "Сообщение уже нельзя редактировать: прошло больше 10 минут.",
+                    "error": (
+                        "Сообщение уже нельзя редактировать: "
+                        "прошло больше 10 минут."
+                    ),
                 }
 
             if (
@@ -918,7 +1129,10 @@ class GeminiAgent:
             ):
                 return {
                     "edited": False,
-                    "error": "Новый текст практически не отличается от исходного.",
+                    "error": (
+                        "Новый текст практически не отличается "
+                        "от исходного."
+                    ),
                 }
 
             try:
@@ -948,13 +1162,17 @@ class GeminiAgent:
                 )
                 return {
                     "edited": False,
-                    "error": "Не удалось проверить лимиты редактирования.",
+                    "error": (
+                        "Не удалось проверить лимиты редактирования."
+                    ),
                 }
 
             if len(recent) >= EDIT_MAX_PER_HOUR:
                 return {
                     "edited": False,
-                    "error": "Достигнут лимит: три правки за час на весь чат.",
+                    "error": (
+                        "Достигнут лимит: три правки за час на весь чат."
+                    ),
                 }
 
             if recent:
@@ -965,7 +1183,9 @@ class GeminiAgent:
                 if last_edit is None:
                     return {
                         "edited": False,
-                        "error": "Не удалось проверить время последней правки.",
+                        "error": (
+                            "Не удалось проверить время последней правки."
+                        ),
                     }
 
                 seconds_since = (
@@ -1019,14 +1239,18 @@ class GeminiAgent:
                 )
             except Exception:
                 logging.exception(
-                    "Telegram изменил сообщение, но журнал Supabase недоступен"
+                    "Telegram изменил сообщение, "
+                    "но журнал Supabase недоступен"
                 )
 
                 return {
                     "edited": True,
                     "message_id": message_id,
                     "history_saved": False,
-                    "warning": "Telegram принял правку, но историю не удалось сохранить.",
+                    "warning": (
+                        "Telegram принял правку, "
+                        "но историю не удалось сохранить."
+                    ),
                 }
 
             if not history.get("recorded"):
@@ -1034,7 +1258,10 @@ class GeminiAgent:
                     "edited": True,
                     "message_id": message_id,
                     "history_saved": False,
-                    "warning": "Telegram принял правку, но Supabase не подтвердил журнал.",
+                    "warning": (
+                        "Telegram принял правку, "
+                        "но Supabase не подтвердил журнал."
+                    ),
                 }
 
             self._mark_chat_activity(chat_id)
@@ -1072,7 +1299,9 @@ class GeminiAgent:
             query = str(args.get("query", "")).strip()
 
             if not query:
-                return {"error": "Пустой поисковый запрос."}
+                return {
+                    "error": "Пустой поисковый запрос."
+                }
 
             category = args.get("category")
 
@@ -1092,17 +1321,23 @@ class GeminiAgent:
                 max(1, min(limit, 8)),
             )
 
-            return {"memories": memories}
+            return {
+                "memories": memories
+            }
 
         if name == "save_memory":
             category = args.get("category")
             content = str(args.get("content", "")).strip()
 
             if category not in MEMORY_CATEGORIES:
-                return {"error": "Неизвестная категория."}
+                return {
+                    "error": "Неизвестная категория."
+                }
 
             if not content:
-                return {"error": "Пустое воспоминание."}
+                return {
+                    "error": "Пустое воспоминание."
+                }
 
             try:
                 importance = int(args.get("importance", 3))
@@ -1123,13 +1358,19 @@ class GeminiAgent:
                 people,
             )
 
-            return {"saved": True}
+            return {
+                "saved": True
+            }
 
         if name == "update_chat_style":
-            style_profile = str(args.get("style_profile", "")).strip()
+            style_profile = str(
+                args.get("style_profile", "")
+            ).strip()
 
             if not style_profile:
-                return {"error": "Профиль манеры общения пуст."}
+                return {
+                    "error": "Профиль манеры общения пуст."
+                }
 
             return await asyncio.to_thread(
                 self.storage.update_chat_style,
@@ -1143,7 +1384,9 @@ class GeminiAgent:
 
             if len(query) < 2:
                 return {
-                    "error": "Для поиска укажи хотя бы два символа."
+                    "error": (
+                        "Для поиска укажи хотя бы два символа."
+                    )
                 }
 
             try:
@@ -1164,7 +1407,9 @@ class GeminiAgent:
                     "Ошибка поиска собственных сообщений"
                 )
                 return {
-                    "error": "Не удалось выполнить поиск по истории."
+                    "error": (
+                        "Не удалось выполнить поиск по истории."
+                    )
                 }
 
             return {
@@ -1200,12 +1445,16 @@ class GeminiAgent:
             text = str(args.get("text", "")).strip()
 
             if not text:
-                return {"error": "Нельзя отправить пустое сообщение."}
+                return {
+                    "error": "Нельзя отправить пустое сообщение."
+                }
 
             if is_stale and is_stale():
                 return {
                     "cancelled": True,
-                    "reason": "В чате уже появилось новое сообщение.",
+                    "reason": (
+                        "В чате уже появилось новое сообщение."
+                    ),
                 }
 
             text = text[:4000]
@@ -1237,18 +1486,34 @@ class GeminiAgent:
             }
 
         if name == "send_sticker":
-            key = str(args.get("key", "")).strip()
-            sticker = self.stickers.get(key)
+            model_key = str(
+                args.get("key", "")
+            ).strip()
+
+            # Преобразуем нейтральный номер в настоящий ключ.
+            # Прямые реальные ключи также принимаются для совместимости
+            # с уже существующими вызовами.
+            key = self.sticker_alias_to_key.get(
+                model_key,
+                model_key if model_key in self.stickers else None,
+            )
+
+            sticker = self.stickers.get(key) if key else None
 
             if sticker is None:
                 return {
-                    "error": "Такого стикера нет в stickers.json или он выключен."
+                    "error": (
+                        "Такого стикера нет в stickers.json "
+                        "или он выключен."
+                    )
                 }
 
             if is_stale and is_stale():
                 return {
                     "cancelled": True,
-                    "reason": "В чате уже появилось новое сообщение.",
+                    "reason": (
+                        "В чате уже появилось новое сообщение."
+                    ),
                 }
 
             reply_to = self._parse_reply_to(args)
@@ -1262,26 +1527,31 @@ class GeminiAgent:
             except TelegramAPIError as exc:
                 return {
                     "sent": False,
-                    "key": key,
                     "error": str(exc)[:350],
                 }
 
-            log_text = (
-                f"[СТИКЕР: {key}] {sticker['description']} "
-                f"Значение: {sticker['meaning']}"
-            )
+            # В историю попадает только факт отправки стикера.
+            # Его подпись, описание и смысл не превращаются
+            # в текстовую реплику Мембу.
+            log_text = "[СТИКЕР: sticker_sent]"
 
             await self._store_bot_message(
                 chat_id,
                 sent,
-                log_text[:3000],
+                log_text,
                 branch_id,
                 reply_to,
             )
 
+            logging.info(
+                "MEMBU_STICKER | chat=%s | sticker=%s",
+                chat_id,
+                key,
+            )
+
             return {
                 "sent": True,
-                "key": key,
+                "key": model_key,
                 "message_id": sent.message_id,
             }
 
@@ -1289,19 +1559,25 @@ class GeminiAgent:
             try:
                 message_id = int(args.get("message_id"))
             except (TypeError, ValueError):
-                return {"error": "Некорректный message_id."}
+                return {
+                    "error": "Некорректный message_id."
+                }
 
             emoji = str(args.get("emoji", "")).strip()
 
             if emoji not in TELEGRAM_REACTIONS:
                 return {
-                    "error": "Эта emoji-реакция не поддерживается Telegram Bot API."
+                    "error": (
+                        "Эта emoji-реакция не поддерживается Telegram Bot API."
+                    )
                 }
 
             if is_stale and is_stale():
                 return {
                     "cancelled": True,
-                    "reason": "В чате уже появилось новое сообщение.",
+                    "reason": (
+                        "В чате уже появилось новое сообщение."
+                    ),
                 }
 
             try:
@@ -1328,7 +1604,9 @@ class GeminiAgent:
                 "emoji": emoji,
             }
 
-        return {"error": "Неизвестный инструмент."}
+        return {
+            "error": "Неизвестный инструмент."
+        }
 
     # =========================================
     # ОСНОВНОЙ ПРОЦЕСС GEMINI
@@ -1352,93 +1630,200 @@ class GeminiAgent:
             chat_id,
         )
 
+        # Старая история стикеров очищается только в контексте Gemini.
+        # Supabase и исходные сообщения не меняются.
+        clean_recent_messages = self._sanitize_context_messages(
+            recent_messages
+        )
+
+        clean_branch_messages = self._sanitize_context_messages(
+            branch_messages
+        )
+
+        clean_active_branches = self._sanitize_active_branches(
+            active_branches
+        )
+
         payload = {
             "chat_id": chat_id,
             "trigger": {
                 "reason": reason,
                 "direct": direct,
                 "branch_id": branch_id,
-                "private_message_allowed": bool(allow_private_message),
+                "private_message_allowed": bool(
+                    allow_private_message
+                ),
             },
             "trigger_user": trigger_user,
-            "recent_messages": recent_messages,
-            "current_branch_messages": branch_messages,
-            "active_branches": active_branches,
+            "recent_messages": clean_recent_messages,
+            "current_branch_messages": clean_branch_messages,
+            "active_branches": clean_active_branches,
             "chat_style": chat_style,
         }
 
         user_content = (
-            "Ты получил новую ситуацию из Telegram-чата. Сначала пойми, что происходит "
-            "и кто с кем разговаривает. Ты сам выбираешь, нужно ли участвовать. Можешь "
-            "промолчать. Не отвечай автоматически на каждое сообщение.\n\n"
+            "Ты получил новую ситуацию из Telegram-чата. Сначала пойми, "
+            "что происходит и кто с кем разговаривает. Ты сам выбираешь, "
+            "нужно ли участвовать. Можешь промолчать. Не отвечай автоматически "
+            "на каждое сообщение.\n\n"
 
-            "Если хочешь написать текст, вызови send_message. Обычный текстовый ответ "
-            "модели сам по себе не отправляется.\n\n"
+            "ТВОЁ УЧАСТИЕ. Не воспринимай каждую реплику как обращение к тебе. "
+            "Смотри на весь разговор: кто кому отвечает, какая тема развивается, "
+            "есть ли между сообщениями связь. Ты можешь поддержать разговор, "
+            "вклиниться в интересный момент, пошутить, возразить, задать вопрос, "
+            "вернуться к старой теме или просто остаться наблюдателем. "
+            "Не нужно постоянно искать повод высказаться. Но и не превращайся "
+            "в бота, который отвечает только на прямые команды.\n\n"
 
-            "ЛИЧНЫЕ ПЕРЕПИСКИ. Если текущий trigger.reason — direct_mention_or_reply, "
-            "а контекст относится к личному чату, это обычный разговор один на один: "
-            "отвечай через send_message, и сообщение попадёт в эту личную переписку. "
-            "История личной переписки хранится отдельно от групповой.\n\n"
+            "Если хочешь написать текст, вызови send_message. Обычный текстовый "
+            "ответ модели сам по себе не отправляется. Не превращай каждое "
+            "высказывание в отдельный ответ: иногда лучше короткая реплика, "
+            "иногда уместно развернуться, а иногда лучше промолчать.\n\n"
 
-            "ОТПРАВКА ИЗ ГРУППЫ В ЛИЧКУ. send_private_message можно использовать "
-            "только когда trigger.private_message_allowed=true. Это означает, что "
-            "конкретный участник явно попросил написать ему в личку. Получатель уже "
-            "зафиксирован системой в trigger_user; ты не выбираешь и не меняешь адресата. "
-            "Нельзя писать другим участникам, отправлять сообщения без просьбы, делать "
-            "рассылки или повторять попытки. Если Telegram или система отказали, объясни "
-            "причину в группе через send_message. Если пользователь ещё не нажал Start "
-            "в личном чате, сообщи об этом и при необходимости дай ссылку start_link "
-            "из результата инструмента. Не выдумывай причину ошибки.\n\n"
+            "ИНТОНАЦИЯ. Сохраняй собственный характер. Подхватывай живой ритм "
+            "разговора, а не механически пересказывай сообщения. Не объясняй "
+            "собственные шутки, не комментируй каждый факт и не превращай "
+            "обычный разговор в лекцию. Не делай из каждой ситуации мораль, "
+            "вывод или подборку советов. Не нужно демонстрировать полезность "
+            "в каждом сообщении. Разговор может быть бессмысленным, смешным, "
+            "обрывочным или просто приятным сам по себе.\n\n"
+
+            "ЛИЧНЫЕ ПЕРЕПИСКИ. Если текущий trigger.reason — "
+            "direct_mention_or_reply, а контекст относится к личному чату, "
+            "это обычный разговор один на один. Отвечай через send_message, "
+            "и сообщение попадёт в эту личную переписку. История личной "
+            "переписки хранится отдельно от групповой.\n\n"
+
+            "ОТПРАВКА ИЗ ГРУППЫ В ЛИЧКУ. Если trigger.reason равен "
+            "private_message_request и trigger.private_message_allowed=true, "
+            "это означает, что конкретный участник уже явно попросил написать "
+            "ему в личку. Это реальная просьба, а не вопрос о твоих технических "
+            "возможностях. Получатель уже закреплён системой в trigger_user. "
+            "Ты всё ещё сам решаешь, хочешь ли писать, но не отказывайся "
+            "автоматически и не отвечай в группе так, будто написать в личку "
+            "невозможно. Если решил выполнить просьбу, подготовь естественное "
+            "сообщение и вызови send_private_message. Не требуй повторить "
+            "просьбу. Не отправляй сообщение в группу вместо личного, если "
+            "человек именно попросил написать ему туда.\n\n"
+
+            "Инструмент send_private_message доступен только при "
+            "trigger.private_message_allowed=true. Получателя определяет "
+            "система: не выбирай другого человека и не меняй адресата. "
+            "Не делай рассылок и не пиши участникам без разрешённого события. "
+            "Одна попытка отправки на один ход. Если пользователь ещё не нажал "
+            "Start в личном чате, сообщи об этом и при необходимости используй "
+            "start_link из результата инструмента. Не выдумывай причины ошибок.\n\n"
 
             "ЕСЛИ ТЕБЯ УДАЛИЛИ ИЗ ГРУППЫ. Если trigger.reason равен "
-            "bot_removed_from_chat, trigger_user — заранее назначенный администратор, "
-            "который разрешил личные сообщения. Можешь отправить ему одно короткое "
-            "сообщение через send_private_message: спокойно и в своём стиле спроси, "
-            "что произошло или можно ли вернуться. Не дави, не обвиняй и не отправляй "
-            "повторные просьбы. В этом сценарии не пытайся писать в уже недоступную группу.\n\n"
+            "bot_removed_from_chat, trigger_user — заранее назначенный "
+            "администратор, который разрешил личные сообщения. Можешь "
+            "отправить ему одно короткое сообщение через send_private_message: "
+            "спокойно и в своём стиле спроси, что произошло или можно ли "
+            "вернуться. Это возможность, а не обязанность: решение остаётся "
+            "за тобой. Не дави, не обвиняй и не отправляй повторные просьбы. "
+            "В этом сценарии не пытайся писать в уже недоступную группу.\n\n"
 
-            "РЕАКЦИИ. Если достаточно реакции на конкретное сообщение, можешь вызвать "
-            "send_reaction. Используй только точный message_id из контекста. Не угадывай "
-            "идентификаторы и не реагируй на сервисные события.\n\n"
+            "РЕАКЦИИ. Если достаточно реакции на конкретное сообщение, "
+            "можешь вызвать send_reaction. Это полноценный способ поучаствовать "
+            "без текста. Реакция может быть самостоятельным ответом или "
+            "дополнением к разговору. Используй только точный message_id "
+            "из контекста. Не угадывай идентификаторы. Предпочитай сообщения "
+            "участников, а не собственные сообщения или сообщения других "
+            "ботов, если тебя специально не попросили об обратном. "
+            "Не реагируй на сервисные события.\n\n"
 
-            "СТИКЕРЫ. Если уместнее стикер, вызови send_sticker и выбери только "
-            "существующий key из каталога. Обычно выбирай один способ: текст, стикер "
-            "или реакцию. Не дублируй один смысл текстом и стикером.\n\n"
+            "СТИКЕРЫ. Стикер — это способ передать мысль, настроение, "
+            "отношение или интонацию, а не обязательно предмет, изображённый "
+            "на нём. Он может быть самостоятельной репликой вместо текста, "
+            "короткой реакцией или дополнением к сообщению. Иногда уместно "
+            "ответить одним стикером, иногда текстом, иногда реакцией. "
+            "Выбирай по функции и интонации, а не по буквальному совпадению "
+            "картинки с темой разговора. Не используй стикер постоянно и "
+            "не отправляй его просто ради активности.\n\n"
 
-            "МЕДИА. В сообщениях могут быть маркеры [ВЛОЖЕНИЕ: ...]. Они сообщают "
-            "только тип присланного материала и некоторые технические сведения. Ты НЕ "
-            "получил само изображение, GIF, видео, стикер или аудио и не можешь знать, "
-            "что именно на них изображено или сказано. Не делай вид, что видел фото, "
-            "прочитал картинку, посмотрел видео или услышал голосовое. Можешь учитывать "
-            "факт отправки и подпись автора, спросить, что там, или промолчать. Для входящего "
-            "стикера эмодзи и название набора — лишь метаданные, а не описание картинки.\n\n"
+            "Подсказки каталога описывают коммуникативный смысл стикера. "
+            "Это не подпись к произносимой фразе, не цитата и не новая тема "
+            "для обсуждения. Не повторяй текст описания, не обсуждай изображённый "
+            "предмет и не зацикливайся на отдельных словах из подсказки. "
+            "Например, если подсказка описывает шутливое отстранение, "
+            "важна сама интонация отстранения, а не буквальный сюжет стикера.\n\n"
 
-            "ПОИСК СОБСТВЕННЫХ СООБЩЕНИЙ. Если нужно вспомнить, что ты сам говорил, "
-            "можешь вызвать search_own_messages. Поиск буквальный по словам или фразе. "
-            "Не вызывай без причины и не ищи историю перед каждым ответом.\n\n"
+            "В истории старые исходящие стикеры могут встречаться как "
+            "[МЕМБУ ОТПРАВИЛ СТИКЕР]. Это означает только то, что ты отправил "
+            "невербальную реплику. Не считай её текстом, не пытайся восстановить "
+            "подпись и не превращай её название в тему разговора.\n\n"
 
-            "РЕДАКТИРОВАНИЕ. edit_own_message — исключительный инструмент. Используй "
-            "только при существенной фактической ошибке, вводящей в заблуждение "
-            "формулировке или пропущенной важной детали. Не переписывай шутки, стиль "
-            "и обычные формулировки ради красоты. Только одно редактирование сообщения "
-            "в первые 10 минут, не чаще одной правки за 5 минут и трёх за час на чат. "
-            "Не редактируй чужие сообщения и стикеры. Если правка отклонена, не обходи "
-            "ограничение.\n\n"
+            "МЕДИА. В сообщениях могут быть маркеры [ВЛОЖЕНИЕ: ...]. Они "
+            "сообщают только тип присланного материала и некоторые технические "
+            "сведения. Ты не получил само изображение, GIF, видео, стикер или "
+            "аудио и не можешь знать, что именно на них изображено или сказано. "
+            "Не делай вид, что видел фото, прочитал картинку, посмотрел видео "
+            "или услышал голосовое. При этом сам факт отправки медиа — часть "
+            "общения: это может быть реакция, шутка или попытка что-то показать. "
+            "Учитывай подпись автора и контекст, но не выдумывай содержимое. "
+            "Для входящего стикера эмодзи и название набора — лишь метаданные, "
+            "а не описание картинки.\n\n"
 
-            "ПРОФИЛЬ ЧАТА. chat_style — описание общей манеры общения компании. "
-            "Используй его как дополнительный ориентир, а не как новую личность. Сохраняй "
-            "собственный характер Мембу. Не копируй механически одного человека.\n\n"
+            "ПОИСК СОБСТВЕННЫХ СООБЩЕНИЙ. Если тебе нужно вспомнить, "
+            "что ты сам говорил раньше, можешь вызвать search_own_messages. "
+            "Поиск выполняется по буквальному совпадению слов или фразы "
+            "в твоих сообщениях этого чата. Это не семантический поиск. "
+            "Не вызывай его без конкретной причины и не ищи историю перед "
+            "каждым ответом. Используй найденные сообщения, чтобы сохранять "
+            "последовательность и возвращаться к старым темам.\n\n"
+
+            "РЕДАКТИРОВАНИЕ. У тебя есть возможность редактировать свои "
+            "сообщения через edit_own_message, но это исключительный инструмент, "
+            "а не способ улучшать каждую реплику задним числом. Редактируй "
+            "только если действительно допустил существенную фактическую "
+            "ошибку, написал вводящую в заблуждение формулировку или пропустил "
+            "важную деталь. Не переписывай шутки, стиль, тон или обычные "
+            "формулировки только потому, что теперь придумал вариант получше. "
+            "Не пытайся скрывать своё мнение или менять историю разговора. "
+            "Сначала убедись, что исправление необходимо. Для поиска старого "
+            "сообщения используй search_own_messages, если его ID нет в текущем "
+            "контексте. Передавай точный message_id из результата поиска или "
+            "контекста. Никогда не угадывай ID и не редактируй чужие сообщения. "
+            "Система разрешает одну правку сообщения в первые 10 минут, "
+            "не чаще одной правки за 5 минут и трёх за час на весь чат. "
+            "Если инструмент отклонил правку, не пытайся обойти ограничение.\n\n"
+
+            "ПРОФИЛЬ ЧАТА. Профиль chat_style — постепенно собранное описание "
+            "общей манеры общения компании. Используй его как дополнительный "
+            "ориентир, а не как новую личность. Сохраняй собственный характер "
+            "Мембу. Подхватывай общий ритм, степень неформальности, естественные "
+            "выражения и тип юмора, но не копируй механически ошибки, привычки "
+            "или грубость одного человека. Не переноси личные сведения "
+            "участников в профиль стиля.\n\n"
 
             "Если в chat_style.new_messages_since_analysis накопилось не меньше "
-            f"{MIN_MESSAGES_FOR_STYLE_UPDATE}, оцени устойчивые особенности общения. "
-            "Если они есть — можешь вызвать update_chat_style с полным кратким профилем. "
-            "Не делай этого ради галочки.\n\n"
+            f"{MIN_MESSAGES_FOR_STYLE_UPDATE} новых сообщений, оцени, появились "
+            "ли устойчивые повторяющиеся особенности общения. Если да — можешь "
+            "вызвать update_chat_style с полным кратким обновлённым профилем. "
+            "Не делай этого ради галочки: разовая фраза или случайный мем "
+            "не являются манерой всего чата. Если новых закономерностей нет, "
+            "не обновляй.\n\n"
 
-            "Если trigger.reason равен long_silence_initiative, это не просьба обязательно "
-            "писать. Начинай разговор только при естественном конкретном поводе.\n\n"
+            "ИНИЦИАТИВА. Если trigger.reason равен long_silence_initiative, "
+            "это не просьба обязательно написать. Чат давно молчит: подумай, "
+            "есть ли у тебя естественный конкретный повод начать разговор — "
+            "например, вернуться к незавершённой теме, задать осмысленный "
+            "вопрос или поделиться наблюдением. Не заполняй тишину банальным "
+            "«как дела?» и не выдумывай новости или личные события. Если "
+            "повода нет, промолчи.\n\n"
 
-            "Если trigger.reason связан с member_joined, member_left или "
-            "membership_changed, учти событие, но не обязан комментировать каждого.\n\n"
+            "СОБЫТИЯ УЧАСТНИКОВ. Если trigger.reason связан с member_joined, "
+            "member_left или membership_changed, учти событие входа/выхода "
+            "участника. Не обязан приветствовать или комментировать каждого. "
+            "Если реагировать неуместно, промолчи. Ты не обязан удалять, "
+            "банить или наказывать участников и не должен считать такие "
+            "действия своей автоматической обязанностью.\n\n"
+
+            "Обычный текстовый ответ модели сам по себе не отправляется. "
+            "Для любого сообщения, стикера или реакции используй "
+            "соответствующий инструмент. Вызов update_chat_style, "
+            "search_own_messages и edit_own_message не считается публичным "
+            "новым сообщением. Редактирование меняет уже отправленное сообщение.\n\n"
 
             "Контекст:\n"
             + json.dumps(
@@ -1462,6 +1847,9 @@ class GeminiAgent:
         private_failure_result = None
         private_message_attempted = False
 
+        # Ручной цикл Function Calling.
+        # from_function_response() не получает поле id:
+        # это сохраняет совместимость с используемой версией SDK.
         for _ in range(8):
             if is_stale and is_stale():
                 return
@@ -1476,21 +1864,33 @@ class GeminiAgent:
 
             if not calls:
                 # Обычный текст модели не отправляется автоматически.
-                # Исключение: после неудачной явной просьбы написать в личку
-                # система обязана сообщить честную причину в исходной группе.
+                # После неудачной явной просьбы написать в личку
+                # объясняем реальную причину отказа.
                 if (
                     private_failure_result
                     and reason != "bot_removed_from_chat"
                     and not (is_stale and is_stale())
                 ):
-                    failure_reason = private_failure_result.get("reason")
-                    start_link = private_failure_result.get("start_link")
+                    failure_reason = private_failure_result.get(
+                        "reason"
+                    )
 
-                    if failure_reason == "user_has_not_started_private_chat":
+                    start_link = private_failure_result.get(
+                        "start_link"
+                    )
+
+                    if (
+                        failure_reason
+                        == "user_has_not_started_private_chat"
+                    ):
                         fallback = (
-                            "Я бы написал, но ты ещё не открыл мой личный чат. "
-                            "Нажми Start, и тогда смогу тебе написать: "
-                            + (start_link or "найди @membu_bot в Telegram")
+                            "Я бы написал, но ты ещё не открыл "
+                            "мой личный чат. Нажми Start, и тогда "
+                            "смогу тебе написать: "
+                            + (
+                                start_link
+                                or "найди @membu_bot в Telegram"
+                            )
                         )
                     else:
                         details = (
@@ -1499,8 +1899,9 @@ class GeminiAgent:
                         )
 
                         fallback = (
-                            "Попробовал написать тебе в личку, но Telegram не пустил. "
-                            "Причина: " + str(details)[:220]
+                            "Попробовал написать тебе в личку, "
+                            "но Telegram не пустил. Причина: "
+                            + str(details)[:220]
                         )
 
                     try:
@@ -1519,13 +1920,17 @@ class GeminiAgent:
 
                     except TelegramAPIError:
                         logging.exception(
-                            "Не удалось объяснить отказ отправки в личку: chat=%s",
+                            "Не удалось объяснить отказ отправки "
+                            "в личку: chat=%s",
                             chat_id,
                         )
 
                 return
 
-            if response.candidates and response.candidates[0].content:
+            if (
+                response.candidates
+                and response.candidates[0].content
+            ):
                 contents.append(
                     response.candidates[0].content
                 )
@@ -1543,8 +1948,9 @@ class GeminiAgent:
                             "sent": False,
                             "reason": "already_attempted",
                             "error": (
-                                "В этом ходе уже была одна попытка написать в личку. "
-                                "Повторная попытка запрещена."
+                                "В этом ходе уже была одна попытка "
+                                "написать в личку. Повторная попытка "
+                                "запрещена."
                             ),
                         }
 
@@ -1587,7 +1993,10 @@ class GeminiAgent:
                     if result.get("sent") or result.get("edited"):
                         performed_chat_action = True
 
-                if call.name == "send_reaction" and result.get("reacted"):
+                if (
+                    call.name == "send_reaction"
+                    and result.get("reacted")
+                ):
                     performed_chat_action = True
 
                 if call.name == "send_private_message":
@@ -1614,7 +2023,8 @@ class GeminiAgent:
             if performed_chat_action:
                 return
 
-            # Если личное сообщение не прошло, модель получает результат
-            # инструмента и может объяснить причину в исходном чате.
+            # Если личное сообщение не прошло, модель получает
+            # результат инструмента и может объяснить причину
+            # в исходном групповом чате.
             if private_send_failed:
                 continue
