@@ -465,6 +465,17 @@ class MembuStorage:
         )
         return len(result.data or [])
 
+    def list_style_profiles(self, limit: int = 20) -> list[dict]:
+        """Профили стиля по чатам, свежие сверху."""
+        result = (
+            self.client.table("membu_chat_profiles")
+            .select("chat_id,style_profile,observed_messages,updated_at")
+            .order("updated_at", desc=True)
+            .limit(max(1, min(limit, 50)))
+            .execute()
+        )
+        return result.data or []
+
     def reset_chat_styles(self) -> None:
         """Сбрасывает выученный стиль чата: Мембу снова опирается только на PERSONALITY."""
         (

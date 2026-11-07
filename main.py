@@ -867,6 +867,61 @@ async def clearall_command(message: Message) -> None:
     )
 
 
+async def style_list_view() -> tuple[str, InlineKeyboardMarkup]:
+    rows = await asyncio.to_thread(storage.list_style_profiles, 20)
+
+    if not rows:
+        return (
+            "Выученной модели общения пока нет. Она появится, когда в чатах накопится переписка.",
+            InlineKeyboardMarkup(inline_keyboard=[]),
+        )
+
+    keyboard = []
+    for row in rows:
+        label = short_label(
+            f"чат {row.get('chat_id')}: ",
+            f"{row.get('observed_messages') or 0} сообщений",
+        )
+        keyboard.append([
+            InlineKeyboardButton(text=label, callback_data=f"sty:view:{row['chat_id']}")
+        ])
+
+    text = "Модель общения по чатам. Нажми на чат, чтобы увидеть профиль и обновить его сейчас."
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+async def style_chat_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    row = await asyncio.to_thread(storage.get_chat_style, chat_id)
+
+    updated = parse_db_time(row.get("updated_at"))
+    updated_text = format_dubai(updated) if updated else "—"
+    profile = (row.get("style_profile") or "").strip() or "пока пусто"
+
+    text = (
+        f"Модель общения, чат {chat_id}\n"
+        f"Сообщений учтено: {row.get('observed_messages') or 0}\n"
+        f"Обновлено: {updated_text} (Дубай)\n\n"
+        f"{profile[:3500]}"
+    )
+
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Обновить сейчас", callback_data=f"sty:refresh:{chat_id}")],
+            [InlineKeyboardButton(text="Назад", callback_data="sty:list")],
+        ]
+    )
+    return text, markup
+
+
+@router.message(Command("style"))
+async def style_command(message: Message) -> None:
+    if not is_owner_dm(message.from_user, message.chat.type) or storage is None:
+        return
+
+    text, markup = await style_list_view()
+    await message.answer(text, reply_markup=markup)
+
+
 @router.message(Command("reset"))
 async def reset_command(message: Message) -> None:
     if not is_owner_dm(message.from_user, message.chat.type):
@@ -1078,7 +1133,7 @@ async def people_command(message: Message) -> None:
 
 
 @router.callback_query(
-    F.data.startswith(("mem:", "msg:", "ppl:", "tab:", "clr:", "rst:"))
+    F.data.startswith(("mem:", "msg:", "ppl:", "tab:", "clr:", "rst:", "sty:"))
 )
 async def handle_owner_callbacks(callback: CallbackQuery) -> None:
     message = callback.message
@@ -1098,6 +1153,32 @@ async def handle_owner_callbacks(callback: CallbackQuery) -> None:
             else:
                 text, markup = await memory_page_view(0)
             await message.edit_text(text, reply_markup=markup)
+            await callback.answer()
+            return
+
+        if kind == "sty":
+            action = parts[1]
+
+            if action == "list":
+                text, markup = await style_list_view()
+                await message.edit_text(text, reply_markup=markup)
+                await callback.answer()
+                return
+
+            if action == "view":
+                text, markup = await style_chat_view(int(parts[2]))
+                await message.edit_text(text, reply_markup=markup)
+                await callback.answer()
+                return
+
+            if action == "refresh":
+                chat_id = int(parts[2])
+                await callback.answer("Обновляю…")
+                await agent.force_style_refresh(chat_id)
+                text, markup = await style_chat_view(chat_id)
+                await message.edit_text(text, reply_markup=markup)
+                return
+
             await callback.answer()
             return
 

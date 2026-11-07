@@ -35,12 +35,13 @@ TELEGRAM_REACTIONS = [
     "🤷", "🤷‍♀", "😡",
 ]
 
-MIN_MESSAGES_FOR_STYLE_UPDATE = 15
+MIN_MESSAGES_FOR_STYLE_UPDATE = 10
 
 # Аналитик стиля смотрит на переписку не чаще, чем раз в эти секунды.
 STYLE_CHECK_INTERVAL_SECONDS = 60
 # Сколько последних сообщений (людей и Мембу) отдаём аналитику стиля.
-STYLE_SAMPLE_SIZE = 60
+STYLE_SAMPLE_SIZE = 100
+MAX_CHAT_ACTIONS_PER_TURN = 2
 
 # Кэш памяти из Supabase: как долго держим его без перезагрузки.
 MEMORY_CACHE_TTL_SECONDS = 300
@@ -50,17 +51,18 @@ MEMORY_IN_CONTEXT = 40
 STYLE_CACHE_TTL_SECONDS = 300
 
 STYLE_ANALYST_INSTRUCTION = (
-    "Ты ведёшь профиль манеры общения Мембу в этом чате. Мембу — персонаж с "
-    "постоянным характером (он описан в PERSONALITY), характер не меняется. "
-    "Меняется только подача, чтобы он звучал как участник этой компании. "
-    "Сначала коротко опиши нормы чата: длину сообщений, сленг, эмодзи, юмор, "
-    "формальность. Затем раздел «Подстройка Мембу»: до 5 пунктов, каждый — "
-    "умеренный шаг от текущей манеры Мембу к нормам чата, например «реже ставить "
-    "эмодзи», «короче реплики в живой перепалке», «можно мягкий сленг». Не предлагай "
-    "смены характера, роли или имени, не отменяй то, что уже задано. Если дан "
-    "текущий профиль, двигайся от него, а не переписывай с нуля. Опирайся только на "
-    "переписку, не выдумывай закономерностей. Не указывай имена участников и личные "
-    "сведения. Простой текст, до 2000 символов, без markdown."
+    "Ты ведёшь профиль манеры общения Мембу в этом чате. Твоя задача — описать, как "
+    "в этом чате принято писать, чтобы Мембу постепенно говорил так же, как участники. "
+    "Смотри на манеру, а не на содержание: длина реплик, регистр, сленг, обращения на "
+    "«ты» или «вы», эмодзи, скобочки, растяжки слов, как люди смеются, насколько "
+    "формально, темп, как реагируют на подколы и грубость. Не переноси в профиль темы, "
+    "факты, шутки, имена и личные сведения участников. Характер Мембу не меняется, его "
+    "ядро описано в PERSONALITY. Подстройка идёт плавно: если дан текущий профиль, "
+    "сохрани большую его часть и измени не больше двух пунктов, а именно те, что явно "
+    "отличаются от реальной переписки. Структура: сначала короткое описание норм чата, "
+    "затем раздел «Подстройка Мембу» до 5 пунктов, каждый — умеренный шаг от текущей "
+    "манеры Мембу к нормам чата. Опирайся только на переписку, не выдумывай "
+    "закономерностей. Простой текст, до 2000 символов, без markdown."
 )
 
 # Дайджест: раз в столько новых сообщений модель выделяет из переписки
@@ -1075,7 +1077,11 @@ class GeminiAgent:
         self._background.add(task)
         task.add_done_callback(self._background.discard)
 
-    async def refresh_chat_style(self, chat_id: int) -> None:
+    async def force_style_refresh(self, chat_id: int) -> None:
+        """Обновляет профиль стиля сейчас, не дожидаясь порога по сообщениям."""
+        await self.refresh_chat_style(chat_id, force=True)
+
+    async def refresh_chat_style(self, chat_id: int, force: bool = False) -> None:
         """Пересобирает профиль манеры чата по настоящей переписке.
 
         Отдельный вызов модели без инструментов: не зависит от того,
@@ -1092,7 +1098,7 @@ class GeminiAgent:
                 chat_id,
             )
 
-            if (
+            if not force and (
                 current.get("new_messages_since_analysis", 0)
                 < MIN_MESSAGES_FOR_STYLE_UPDATE
             ):
@@ -1144,7 +1150,7 @@ class GeminiAgent:
                 self.storage.update_chat_style,
                 chat_id,
                 profile_text,
-                MIN_MESSAGES_FOR_STYLE_UPDATE,
+                0 if force else MIN_MESSAGES_FOR_STYLE_UPDATE,
             )
 
             if result.get("updated"):
@@ -1284,6 +1290,11 @@ class GeminiAgent:
             "нужно ли участвовать. Можешь промолчать. Не отвечай автоматически "
             "на каждое сообщение.\n\n"
 
+            "За один ответ можно отправить не больше двух сообщений. Вторую реплику "
+            "ставь только если она что-то добавляет. Её можно отправить как ответ на любое "
+            "сообщение (в том числе из истории или recalled_history, по message_id), как "
+            "ответ на собственное сообщение Мембу или отдельным сообщением. Чаще хватает одного.\n\n"
+
             "Если хочешь написать текст, вызови send_message. Эмодзи можешь "
             "добавить прямо в текст, только если они естественно передают интонацию. "
             "Не ставь эмодзи автоматически и не украшай ими каждую реплику.\n\n"
@@ -1407,6 +1418,7 @@ class GeminiAgent:
 
         used_tools = False
         nudged = False
+        chat_actions = 0
 
         for _ in range(8):
             if is_stale and is_stale():
@@ -1426,7 +1438,7 @@ class GeminiAgent:
             if not calls:
                 # Текст сам по себе в чат не уходит. Если модель искала в истории
                 # и ничего не отправила, один раз просим её вызвать send_message.
-                if direct and used_tools and not nudged:
+                if direct and used_tools and not nudged and chat_actions == 0:
                     nudged = True
                     if response.candidates and response.candidates[0].content:
                         contents.append(response.candidates[0].content)
@@ -1457,8 +1469,6 @@ class GeminiAgent:
                     response.candidates[0].content
                 )
 
-            performed_chat_action = False
-
             for call in calls:
                 if is_stale and is_stale():
                     return
@@ -1473,7 +1483,7 @@ class GeminiAgent:
 
                 if call.name in {"send_message", "send_sticker", "send_reaction"}:
                     if result.get("sent") or result.get("reacted"):
-                        performed_chat_action = True
+                        chat_actions += 1
 
                 function_response = types.Part.from_function_response(
                     name=call.name,
@@ -1487,9 +1497,8 @@ class GeminiAgent:
                     )
                 )
 
-            # После публичного действия не просим модель тут же
-            # генерировать ещё одну реплику.
-            if performed_chat_action:
+            # Больше двух публичных действий за один ответ не отправляем.
+            if chat_actions >= MAX_CHAT_ACTIONS_PER_TURN:
                 return
 
     def maybe_refresh_digest(self, chat_id: int) -> None:
