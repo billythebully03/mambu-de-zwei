@@ -24,6 +24,7 @@ from aiogram.types import (
 from membu import MembuCore
 from storage import MembuStorage
 from gemini_agent import GeminiAgent
+from web_server import start_web_server
 
 TOKEN = os.getenv("TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -711,7 +712,7 @@ async def memory_page_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
         [
             InlineKeyboardButton(
                 text=memory_label(row),
-                callback_data=f"mem:del:{row['id']}:{page}",
+                callback_data=f"mem:view:{row['id']}:{page}",
             )
         ]
         for row in chunk
@@ -737,12 +738,61 @@ async def memory_page_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
     ])
 
     text = (
-        "Настройка памяти\n\n"
+        "Настройка памяти · Общая память\n\n"
         "Ниже все-все логи, которые запомнил Мембу. "
-        "Нажми на запись, чтобы удалить её из памяти. "
+        "Нажми на запись, чтобы открыть её полностью, удалить или вернуться назад. "
         f"Всего: {len(rows)}."
     )
     return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def parse_db_time(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+async def memory_detail_view(
+    memory_id: int,
+    page: int,
+) -> tuple[str, InlineKeyboardMarkup] | None:
+    row = await asyncio.to_thread(storage.get_memory, memory_id)
+
+    if row is None:
+        return None
+
+    people = ", ".join(row.get("people") or []) or "—"
+    updated = parse_db_time(row.get("updated_at"))
+    updated_text = format_dubai(updated) if updated else "—"
+
+    text = (
+        f"Воспоминание #{row['id']}\n"
+        f"Категория: {row.get('category')}\n"
+        f"Важность: {row.get('importance')}/5\n"
+        f"Люди: {people}\n"
+        f"Чат: {row.get('chat_id')}\n"
+        f"Обновлено: {updated_text} (Дубай)\n\n"
+        f"{row.get('content', '')}"
+    )
+
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Удалить",
+                    callback_data=f"mem:del:{row['id']}:{page}",
+                ),
+                InlineKeyboardButton(
+                    text="Назад",
+                    callback_data=f"mem:page:{page}",
+                ),
+            ]
+        ]
+    )
+    return text, markup
 
 
 async def build_status_text() -> str:
@@ -833,6 +883,22 @@ async def handle_owner_callbacks(callback: CallbackQuery) -> None:
             action = parts[1]
 
             if action == "noop":
+                await callback.answer()
+                return
+
+            if action == "view":
+                memory_id = int(parts[2])
+                page = int(parts[3])
+                view = await memory_detail_view(memory_id, page)
+
+                if view is None:
+                    await callback.answer("Запись уже удалена")
+                    text, markup = await memory_page_view(page)
+                    await message.edit_text(text, reply_markup=markup)
+                    return
+
+                text, markup = view
+                await message.edit_text(text, reply_markup=markup)
                 await callback.answer()
                 return
 
@@ -1071,6 +1137,9 @@ async def main() -> None:
             IDLE_INITIATIVE_SECONDS,
             IDLE_INITIATIVE_COOLDOWN_SECONDS,
         )
+
+        # Web-сервис Render требует открытый порт. Поднимаем Flask в фоне.
+        start_web_server()
 
         # Не сбрасываем сообщения, пришедшие во время простоя или деплоя.
         await bot.delete_webhook(

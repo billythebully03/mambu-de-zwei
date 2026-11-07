@@ -433,3 +433,15 @@ class MembuStorage:
             .execute()
         )
         return len(result.data or [])
+
+    def get_memory(self, memory_id: int) -> dict | None:
+        """Одна запись памяти для подробного просмотра."""
+        result = (
+            self.client.table("membu_memories")
+            .select("id,chat_id,category,content,people,importance,updated_at")
+            .eq("id", memory_id)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        return rows[0] if rows else None
