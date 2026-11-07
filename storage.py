@@ -196,6 +196,10 @@ class MembuStorage:
             branch_id,
         ).execute()
 
+    # =========================================
+    # ДОЛГОВРЕМЕННАЯ ПАМЯТЬ
+    # =========================================
+
     def search_memories(
         self,
         chat_id: int,
@@ -236,6 +240,10 @@ class MembuStorage:
             data,
             on_conflict="chat_id,category,content",
         ).execute()
+
+    # =========================================
+    # ПРОФИЛЬ СТИЛЯ ЧАТА
+    # =========================================
 
     def get_chat_style(
         self,
@@ -333,7 +341,7 @@ class MembuStorage:
         }
 
     # =========================================
-    # ПОИСК СОБСТВЕННЫХ СООБЩЕНИЙ МЕМБУ
+    # ПОИСК И РЕДАКТИРОВАНИЕ СООБЩЕНИЙ
     # =========================================
 
     def search_own_messages(
@@ -343,39 +351,25 @@ class MembuStorage:
         query: str,
         limit: int = 5,
     ) -> list[dict]:
-        """
-        Ищет только сообщения Мембу в указанном чате.
-
-        Поиск буквальный: запрос должен встречаться в тексте
-        сообщения как подстрока.
-        """
-
         query = str(query or "").strip()[:120]
 
         if len(query) < 2:
             return []
 
-        # Экранируем символы шаблона LIKE, чтобы введённые
-        # пользователем проценты и подчёркивания не превращались
-        # в произвольные маски поиска.
-        escaped_query = (
-            query
-            .replace("\\", "\\\\")
+        escaped = (
+            query.replace("\\", "\\\\")
             .replace("%", "\\%")
             .replace("_", "\\_")
         )
 
-        pattern = f"%{escaped_query}%"
-
         result = (
             self.client.table("membu_messages")
             .select(
-                "message_id,text,created_at,"
-                "reply_to_message_id,branch_id"
+                "message_id,text,created_at,reply_to_message_id,branch_id"
             )
             .eq("chat_id", chat_id)
             .eq("sender_id", sender_id)
-            .ilike("text", pattern)
+            .ilike("text", f"%{escaped}%")
             .order("created_at", desc=True)
             .limit(max(1, min(limit, 8)))
             .execute()
@@ -383,17 +377,12 @@ class MembuStorage:
 
         messages = result.data or []
 
-        # Не передаём модели чрезмерно длинные фрагменты истории.
-        for message in messages:
-            message["text"] = str(
-                message.get("text") or ""
+        for item in messages:
+            item["text"] = str(
+                item.get("text") or ""
             )[:1500]
 
         return messages
-
-    # =========================================
-    # ПРОВЕРКА ИСТОРИИ И ПРАВ НА РЕДАКТИРОВАНИЕ
-    # =========================================
 
     def get_own_message(
         self,
@@ -401,11 +390,6 @@ class MembuStorage:
         message_id: int,
         sender_id: int,
     ) -> dict | None:
-        """
-        Возвращает сообщение только в том случае,
-        если оно действительно принадлежит Мембу.
-        """
-
         result = (
             self.client.table("membu_messages")
             .select(
@@ -420,20 +404,13 @@ class MembuStorage:
 
         rows = result.data or []
 
-        if not rows:
-            return None
-
-        return rows[0]
+        return rows[0] if rows else None
 
     def has_message_been_edited(
         self,
         chat_id: int,
         message_id: int,
     ) -> bool:
-        """
-        Проверяет, редактировалось ли сообщение раньше.
-        """
-
         result = (
             self.client.table("membu_message_edits")
             .select("id")
@@ -452,11 +429,6 @@ class MembuStorage:
         since_minutes: int = 60,
         limit: int = 3,
     ) -> list[dict]:
-        """
-        Возвращает последние правки Мембу в чате
-        за указанный промежуток времени.
-        """
-
         since_minutes = max(
             1,
             min(int(since_minutes), 60),
@@ -494,13 +466,6 @@ class MembuStorage:
         new_text: str,
         reason: str,
     ) -> dict:
-        """
-        Атомарно обновляет текст сообщения в истории
-        и записывает журнал редактирования.
-
-        SQL-функция выполняет обе операции в одной транзакции.
-        """
-
         result = self.client.rpc(
             "record_membu_message_edit",
             {
@@ -518,13 +483,135 @@ class MembuStorage:
         if isinstance(data, dict):
             return data
 
-        if isinstance(data, list) and data:
-            first = data[0]
-
-            if isinstance(first, dict):
-                return first
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            return data[0]
 
         return {
             "recorded": bool(data),
             "reason": None if data else "empty_rpc_result",
         }
+
+    # =========================================
+    # ЛИЧНЫЕ СООБЩЕНИЯ
+    # =========================================
+
+    def register_private_user(
+        self,
+        user_id: int,
+        private_chat_id: int,
+        first_name: str = "",
+        username: str = "",
+    ):
+        """Фиксирует добровольное начало личного диалога с ботом."""
+
+        data = {
+            "user_id": user_id,
+            "private_chat_id": private_chat_id,
+            "first_name": first_name[:150],
+            "username": username[:100],
+            "enabled": True,
+            "last_seen_at": self._utc_now(),
+        }
+
+        self.client.table("membu_private_users").upsert(
+            data,
+            on_conflict="user_id",
+        ).execute()
+
+    def set_private_user_enabled(
+        self,
+        user_id: int,
+        enabled: bool,
+    ):
+        self.client.table("membu_private_users").update(
+            {
+                "enabled": bool(enabled),
+                "last_seen_at": self._utc_now(),
+            }
+        ).eq(
+            "user_id",
+            user_id,
+        ).execute()
+
+    def has_private_chat_opt_in(
+        self,
+        user_id: int,
+    ) -> bool:
+        """Пользователь сам открыл личный чат и не заблокировал Мембу."""
+
+        result = (
+            self.client.table("membu_private_users")
+            .select("user_id")
+            .eq("user_id", user_id)
+            .eq("enabled", True)
+            .limit(1)
+            .execute()
+        )
+
+        return bool(result.data)
+
+    def set_chat_contact(
+        self,
+        chat_id: int,
+        user_id: int,
+        display_name: str = "",
+        username: str = "",
+    ):
+        data = {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "display_name": display_name[:200],
+            "username": username[:100],
+            "updated_at": self._utc_now(),
+        }
+
+        self.client.table("membu_chat_contacts").upsert(
+            data,
+            on_conflict="chat_id",
+        ).execute()
+
+    def remove_chat_contact(
+        self,
+        chat_id: int,
+    ):
+        self.client.table("membu_chat_contacts").delete().eq(
+            "chat_id",
+            chat_id,
+        ).execute()
+
+    def get_chat_contact(
+        self,
+        chat_id: int,
+    ) -> dict | None:
+        result = (
+            self.client.table("membu_chat_contacts")
+            .select("chat_id,user_id,display_name,username,last_notified_at")
+            .eq("chat_id", chat_id)
+            .limit(1)
+            .execute()
+        )
+
+        rows = result.data or []
+
+        return rows[0] if rows else None
+
+    def claim_chat_contact_notice(
+        self,
+        chat_id: int,
+    ) -> dict | None:
+        """Атомарно разрешает не более одного уведомления за 24 часа."""
+
+        result = self.client.rpc(
+            "claim_membu_removal_notice",
+            {"p_chat_id": chat_id},
+        ).execute()
+
+        data = result.data
+
+        if isinstance(data, dict):
+            return data
+
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            return data[0]
+
+        return None
