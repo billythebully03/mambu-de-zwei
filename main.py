@@ -75,7 +75,11 @@ IDLE_INITIATIVE_COOLDOWN_SECONDS = max(
 BOT_IN_CHAT_STATUSES = {"member", "administrator", "creator"}
 
 # Команды управления доступны только в личке и только этому пользователю.
-OWNER_USERNAME = os.getenv("MEMBU_OWNER_USERNAME", "ibartyom").lower()
+OWNER_USERNAMES = {
+    name.strip().lstrip("@").lower()
+    for name in os.getenv("MEMBU_OWNER_USERNAMES", "ibartyom,Ribapibaa").split(",")
+    if name.strip()
+}
 MEMORY_PAGE_SIZE = 8
 DUBAI_TZ = timezone(timedelta(hours=4))
 STARTED_AT = datetime.now(timezone.utc)
@@ -680,7 +684,7 @@ def is_owner_dm(user: User | None, chat_type: str) -> bool:
         user
         and user.username
         and chat_type == "private"
-        and user.username.lower() == OWNER_USERNAME
+        and user.username.lower() in OWNER_USERNAMES
     )
 
 

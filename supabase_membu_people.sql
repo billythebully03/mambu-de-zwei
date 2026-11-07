@@ -12,3 +12,11 @@ create table if not exists public.membu_people (
 
 create index if not exists membu_people_updated
 on public.membu_people (updated_at desc);
+
+alter table public.membu_people enable row level security;
+
+grant all on public.membu_people
+to service_role;
+
+revoke all on public.membu_people
+from anon, authenticated;

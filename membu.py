@@ -17,7 +17,7 @@ class Decision:
 class MembuCore:
     def __init__(
         self,
-        spontaneous_probability: float = 0.015,
+        spontaneous_probability: float = 0.03,
         spontaneous_cooldown: float = 45,
         branch_cooldown: float = 10,
         direct_cooldown: float = 5,
