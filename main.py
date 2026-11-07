@@ -2,17 +2,17 @@ import asyncio
 import logging
 import os
 import re
-from typing import Any
+from typing import Callable
 
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ChatAction
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from aiogram.types import Message, User
-from aiogram.exceptions import TelegramAPIError
 
 from membu import MembuCore
 from storage import MembuStorage
 from gemini_agent import GeminiAgent
-
 
 TOKEN = os.getenv("TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -32,30 +32,50 @@ BRANCH_TTL = int(
     os.getenv("MEMBU_BRANCH_TTL_SECONDS", "300")
 )
 
+# Через сколько тишины Мембу получит возможность самому начать разговор.
+IDLE_INITIATIVE_SECONDS = max(
+    60,
+    int(os.getenv("MEMBU_IDLE_SECONDS", "1200")),
+)
+
+# Даже если чат продолжает молчать, повторно предлагать инициативу
+# Gemini будет не чаще одного раза за этот промежуток.
+IDLE_INITIATIVE_COOLDOWN_SECONDS = max(
+    IDLE_INITIATIVE_SECONDS,
+    int(os.getenv("MEMBU_IDLE_COOLDOWN_SECONDS", "3600")),
+)
+
+# Telegram показывает typing максимум 5 секунд. Обновляем чаще этого срока.
+TYPING_REFRESH_SECONDS = 4.0
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
 router = Router()
-
 membu = MembuCore()
 
 bot_user: User | None = None
 storage: MembuStorage | None = None
 agent: GeminiAgent | None = None
+bot: Bot | None = None
 
 scheduled_tasks: dict[tuple[int, str], asyncio.Task] = {}
+
+# Мониторим тишину только в группах, где Мембу уже видел активность.
+group_chat_ids: set[int] = set()
+chat_last_activity: dict[int, float] = {}
+chat_user_activity_version: dict[int, int] = {}
+chat_idle_events: dict[int, asyncio.Event] = {}
+chat_idle_tasks: dict[int, asyncio.Task] = {}
+chat_last_idle_attempt: dict[int, float] = {}
 
 
 def is_mentioned(message: Message, current_bot: User) -> bool:
     text = message.text or message.caption or ""
 
-    for entity in (
-        message.entities or []
-    ) + (
-        message.caption_entities or []
-    ):
+    for entity in (message.entities or []) + (message.caption_entities or []):
         if (
             entity.type == "text_mention"
             and entity.user
@@ -64,44 +84,94 @@ def is_mentioned(message: Message, current_bot: User) -> bool:
             return True
 
     username = current_bot.username
-
     if not username:
         return False
 
     pattern = rf"(?<![\w])@{re.escape(username)}(?!\w)"
-
-    return bool(
-        re.search(pattern, text, flags=re.IGNORECASE)
-    )
+    return bool(re.search(pattern, text, flags=re.IGNORECASE))
 
 
 def is_reply_to_bot(message: Message, current_bot: User) -> bool:
     replied = message.reply_to_message
-
     if not replied or not replied.from_user:
         return False
-
     return replied.from_user.id == current_bot.id
 
 
-async def process_after_pause(
+def mark_chat_activity(chat_id: int, *, human_activity: bool = True) -> None:
+    """Обновляет таймер тишины. Вызов должен происходить внутри event loop."""
+    if chat_id not in group_chat_ids:
+        return
+
+    loop = asyncio.get_running_loop()
+    chat_last_activity[chat_id] = loop.time()
+
+    if human_activity:
+        chat_user_activity_version[chat_id] = (
+            chat_user_activity_version.get(chat_id, 0) + 1
+        )
+
+    event = chat_idle_events.get(chat_id)
+    if event is not None:
+        event.set()
+
+    task = chat_idle_tasks.get(chat_id)
+    if task is None or task.done():
+        chat_idle_tasks[chat_id] = asyncio.create_task(
+            idle_initiative_monitor(chat_id)
+        )
+
+
+def register_group_activity(chat_id: int) -> None:
+    group_chat_ids.add(chat_id)
+    if chat_id not in chat_user_activity_version:
+        chat_user_activity_version[chat_id] = 0
+    if chat_id not in chat_last_activity:
+        chat_last_activity[chat_id] = asyncio.get_running_loop().time()
+    mark_chat_activity(chat_id, human_activity=True)
+
+
+async def typing_indicator(chat_id: int) -> None:
+    """Показывает штатный статус Telegram «печатает…», без отдельного сообщения."""
+    if bot is None:
+        return
+
+    while True:
+        try:
+            await bot.send_chat_action(
+                chat_id=chat_id,
+                action=ChatAction.TYPING,
+            )
+        except TelegramAPIError as exc:
+            logging.debug(
+                "Не удалось обновить typing status в чате %s: %s",
+                chat_id,
+                exc,
+            )
+        await asyncio.sleep(TYPING_REFRESH_SECONDS)
+
+
+async def run_agent_with_context(
     chat_id: int,
     branch_id: str | None,
     reason: str,
     direct: bool,
-    wait_seconds: float,
-    task_key: tuple[int, str],
-):
-    current_task = asyncio.current_task()
+    *,
+    is_stale: Callable[[], bool] | None = None,
+) -> None:
+    if storage is None or agent is None:
+        return
+
+    if is_stale and is_stale():
+        logging.info(
+            "MEMBU | chat=%s | initiative_cancelled=stale_context",
+            chat_id,
+        )
+        return
+
+    typing_task = asyncio.create_task(typing_indicator(chat_id))
 
     try:
-        await asyncio.sleep(
-            DEBOUNCE_SECONDS + max(0, wait_seconds)
-        )
-
-        if storage is None or agent is None:
-            return
-
         recent = await asyncio.to_thread(
             storage.recent_messages,
             chat_id,
@@ -109,7 +179,6 @@ async def process_after_pause(
         )
 
         branch_messages = []
-
         if branch_id:
             branch_messages = await asyncio.to_thread(
                 storage.branch_messages,
@@ -133,6 +202,13 @@ async def process_after_pause(
                 12,
             )
 
+        if is_stale and is_stale():
+            logging.info(
+                "MEMBU | chat=%s | initiative_cancelled=stale_context_before_gemini",
+                chat_id,
+            )
+            return
+
         await agent.process(
             chat_id=chat_id,
             branch_id=branch_id,
@@ -141,6 +217,37 @@ async def process_after_pause(
             recent_messages=recent,
             branch_messages=branch_messages,
             active_branches=active_branches,
+            is_stale=is_stale,
+        )
+
+    finally:
+        typing_task.cancel()
+        try:
+            await typing_task
+        except asyncio.CancelledError:
+            pass
+
+
+async def process_after_pause(
+    chat_id: int,
+    branch_id: str | None,
+    reason: str,
+    direct: bool,
+    wait_seconds: float,
+    task_key: tuple[int, str],
+) -> None:
+    current_task = asyncio.current_task()
+
+    try:
+        await asyncio.sleep(
+            DEBOUNCE_SECONDS + max(0, wait_seconds)
+        )
+
+        await run_agent_with_context(
+            chat_id=chat_id,
+            branch_id=branch_id,
+            reason=reason,
+            direct=direct,
         )
 
     except asyncio.CancelledError:
@@ -163,14 +270,13 @@ def schedule_agent(
     reason: str,
     direct: bool,
     wait_seconds: float,
-):
+) -> None:
     key = (
         chat_id,
         branch_id or "__general__",
     )
 
     old_task = scheduled_tasks.get(key)
-
     if old_task and not old_task.done():
         old_task.cancel()
 
@@ -184,12 +290,91 @@ def schedule_agent(
             task_key=key,
         )
     )
-
     scheduled_tasks[key] = task
 
 
+async def idle_initiative_monitor(chat_id: int) -> None:
+    """Даёт Gemini шанс начать разговор после длительной тишины."""
+    event = chat_idle_events.setdefault(chat_id, asyncio.Event())
+    loop = asyncio.get_running_loop()
+
+    try:
+        while True:
+            # Снимок версии позволяет отменить устаревшую инициативу,
+            # если кто-то написал, пока Gemini обдумывает сообщение.
+            event.clear()
+            activity_version = chat_user_activity_version.get(chat_id, 0)
+            last_activity = chat_last_activity.get(chat_id, loop.time())
+            last_attempt = chat_last_idle_attempt.get(chat_id)
+
+            next_allowed = (
+                last_attempt + IDLE_INITIATIVE_COOLDOWN_SECONDS
+                if last_attempt is not None
+                else 0.0
+            )
+            wake_at = max(
+                last_activity + IDLE_INITIATIVE_SECONDS,
+                next_allowed,
+            )
+            timeout = max(0.0, wake_at - loop.time())
+
+            try:
+                await asyncio.wait_for(event.wait(), timeout=timeout)
+                continue
+            except asyncio.TimeoutError:
+                pass
+
+            if activity_version != chat_user_activity_version.get(chat_id, 0):
+                continue
+
+            if storage is None or agent is None:
+                await asyncio.sleep(5)
+                continue
+
+            logging.info(
+                "MEMBU | chat=%s | initiative=checking_after_silence | idle_seconds=%s",
+                chat_id,
+                int(loop.time() - chat_last_activity.get(chat_id, loop.time())),
+            )
+
+            is_stale = lambda: (
+                activity_version
+                != chat_user_activity_version.get(chat_id, 0)
+            )
+
+            try:
+                await run_agent_with_context(
+                    chat_id=chat_id,
+                    branch_id=None,
+                    reason="long_silence_initiative",
+                    direct=False,
+                    is_stale=is_stale,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.exception(
+                    "Ошибка инициативы Мембу в чате %s",
+                    chat_id,
+                )
+
+            # Не ставим кулдаун, если за время размышления кто-то написал:
+            # следующую возможность можно будет оценить после новой тишины.
+            if not is_stale():
+                chat_last_idle_attempt[chat_id] = loop.time()
+
+    except asyncio.CancelledError:
+        raise
+    finally:
+        if chat_idle_tasks.get(chat_id) is asyncio.current_task():
+            chat_idle_tasks.pop(chat_id, None)
+
+
 @router.message(Command("privacy"))
-async def privacy_command(message: Message):
+async def privacy_command(message: Message) -> None:
+    if message.chat.type in {"group", "supergroup"}:
+        register_group_activity(message.chat.id)
+
     await message.reply(
         "Я могу получать сообщения этого чата, если Telegram "
         "передаёт их мне. Контекст отдельных разговоров может "
@@ -199,8 +384,108 @@ async def privacy_command(message: Message):
     )
 
 
+def format_member(user: User) -> str:
+    name = user.full_name or user.first_name or "участник"
+    if user.username:
+        return f"{name} (@{user.username})"
+    return name
+
+
+@router.message(F.new_chat_members | F.left_chat_member)
+async def handle_membership_event(message: Message) -> None:
+    """Сохраняет события входа/выхода и передаёт их Мембу на оценку."""
+    if storage is None or bot_user is None:
+        return
+
+    if message.chat.type not in {"group", "supergroup"}:
+        return
+
+    register_group_activity(message.chat.id)
+
+    joined = [
+        user
+        for user in (message.new_chat_members or [])
+        if user.id != bot_user.id
+    ]
+    left = message.left_chat_member
+    if left and left.id == bot_user.id:
+        left = None
+
+    # Событие может сообщать только о добавлении самого Мембу.
+    if not joined and left is None:
+        logging.info(
+            "MEMBU | chat=%s | membership_event=bot_join_or_leave",
+            message.chat.id,
+        )
+        return
+
+    descriptions: list[str] = []
+    if joined:
+        actor_id = message.from_user.id if message.from_user else None
+        joined_descriptions = []
+        for user in joined:
+            if actor_id == user.id:
+                joined_descriptions.append(
+                    f"сам присоединился: {format_member(user)}"
+                )
+            else:
+                joined_descriptions.append(
+                    f"добавлен в чат: {format_member(user)}"
+                )
+        descriptions.extend(joined_descriptions)
+
+    if left is not None:
+        actor_id = message.from_user.id if message.from_user else None
+        if actor_id == left.id:
+            descriptions.append(
+                f"сам покинул чат: {format_member(left)}"
+            )
+        else:
+            descriptions.append(
+                f"удалён из чата: {format_member(left)}"
+            )
+
+    event_text = "[СОБЫТИЕ ЧАТА] " + "; ".join(descriptions)
+    actor = message.from_user
+
+    await asyncio.to_thread(
+        storage.add_message,
+        {
+            "chat_id": message.chat.id,
+            "message_id": message.message_id,
+            "sender_id": actor.id if actor else None,
+            "sender_name": actor.full_name if actor else "Telegram",
+            "username": actor.username if actor and actor.username else "",
+            "text": event_text,
+            "reply_to_user_id": None,
+            "reply_to_message_id": None,
+            "branch_id": None,
+            "ts": message.date.timestamp(),
+        },
+    )
+
+    reason = "member_joined" if joined and not left else "member_left"
+    if joined and left:
+        reason = "membership_changed"
+
+    logging.info(
+        "MEMBU | chat=%s | membership_event=%s | %s",
+        message.chat.id,
+        reason,
+        event_text,
+    )
+
+    schedule_agent(
+        chat_id=message.chat.id,
+        branch_id=None,
+        reason=reason,
+        direct=False,
+        wait_seconds=0,
+    )
+
+
 @router.message()
-async def handle_message(message: Message):
+async def handle_message(message: Message) -> None:
     global bot_user, storage
 
     if bot_user is None or storage is None:
@@ -209,21 +494,22 @@ async def handle_message(message: Message):
     if message.from_user is None:
         return
 
-    # Не обрабатываем сообщения самого Мембу и других ботов.
+    # Сообщения самого Мембу и других ботов не запускают новую обработку.
     if message.from_user.is_bot:
         return
 
-    text = message.text or message.caption or ""
+    chat_id = message.chat.id
+    if message.chat.type in {"group", "supergroup"}:
+        # Считаем активностью и фото/стикеры/голосовые, даже если их
+        # текстовая подпись пуста и текущая AI-логика их не анализирует.
+        register_group_activity(chat_id)
 
+    text = message.text or message.caption or ""
     if not text.strip():
         return
 
-    chat_id = message.chat.id
-
     mentioned = is_mentioned(message, bot_user)
     replied_to_bot = is_reply_to_bot(message, bot_user)
-
-    # В личной переписке каждое сообщение адресовано боту.
     private_chat = message.chat.type == "private"
 
     direct = (
@@ -237,14 +523,10 @@ async def handle_message(message: Message):
     reply_to_branch_id = None
 
     if message.reply_to_message:
-        reply_to_message_id = (
-            message.reply_to_message.message_id
-        )
+        reply_to_message_id = message.reply_to_message.message_id
 
         if message.reply_to_message.from_user:
-            reply_to_user_id = (
-                message.reply_to_message.from_user.id
-            )
+            reply_to_user_id = message.reply_to_message.from_user.id
 
         reply_to_branch_id = await asyncio.to_thread(
             storage.get_branch_for_message,
@@ -258,16 +540,12 @@ async def handle_message(message: Message):
         BRANCH_TTL,
     )
 
-    event: dict[str, Any] = {
+    event: dict = {
         "chat_id": chat_id,
         "message_id": message.message_id,
         "sender_id": message.from_user.id,
-        "sender_name": (
-            message.from_user.full_name or ""
-        ),
-        "username": (
-            message.from_user.username or ""
-        ),
+        "sender_name": message.from_user.full_name or "",
+        "username": message.from_user.username or "",
         "text": text[:3000],
         "reply_to_user_id": reply_to_user_id,
         "reply_to_message_id": reply_to_message_id,
@@ -291,7 +569,6 @@ async def handle_message(message: Message):
             branch["branch_id"]
             for branch in active_branches
         }
-
         if decision.branch_id not in existing_ids:
             await asyncio.to_thread(
                 storage.create_branch,
@@ -335,8 +612,8 @@ async def handle_message(message: Message):
     )
 
 
-async def main():
-    global bot_user, storage, agent
+async def main() -> None:
+    global bot_user, storage, agent, bot
 
     required = {
         "TOKEN": TOKEN,
@@ -373,19 +650,25 @@ async def main():
             bot=bot,
             bot_user=bot_user,
             model=GEMINI_MODEL,
+            activity_callback=lambda chat_id: mark_chat_activity(
+                chat_id,
+                human_activity=False,
+            ),
         )
 
         dp = Dispatcher()
         dp.include_router(router)
 
         logging.info(
-            "Мембу запущен: @%s | model=%s",
+            "Мембу запущен: @%s | model=%s | idle=%ss | idle_cooldown=%ss",
             bot_user.username,
             GEMINI_MODEL,
+            IDLE_INITIATIVE_SECONDS,
+            IDLE_INITIATIVE_COOLDOWN_SECONDS,
         )
 
         await bot.delete_webhook(
-            drop_pending_updates=True
+            drop_pending_updates=True,
         )
 
         await dp.start_polling(
@@ -397,7 +680,15 @@ async def main():
         for task in scheduled_tasks.values():
             task.cancel()
 
-        await bot.session.close()
+        for task in chat_idle_tasks.values():
+            task.cancel()
+
+        all_tasks = list(scheduled_tasks.values()) + list(chat_idle_tasks.values())
+        if all_tasks:
+            await asyncio.gather(*all_tasks, return_exceptions=True)
+
+        if bot is not None:
+            await bot.session.close()
 
 
 if __name__ == "__main__":
