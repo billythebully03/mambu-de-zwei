@@ -143,6 +143,12 @@ def is_mentioned(message: Message, current_bot: User) -> bool:
         ):
             return True
 
+    # Имя в тексте тоже считается обращением: запрос уходит в ИИ, а он сам решает,
+    # ответить, поставить реакцию или промолчать.
+    name_pattern = r"(?<![\w])(мембу|membu)(?!\w)"
+    if re.search(name_pattern, text, flags=re.IGNORECASE):
+        return True
+
     username = current_bot.username
     if not username:
         return False
