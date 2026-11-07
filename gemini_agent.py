@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Callable
@@ -127,6 +128,22 @@ def parse_digest_items(raw: str) -> list[dict]:
         )
 
     return items
+
+
+# Признаки того, что человек просит вспомнить прошлое. Совпадение запускает
+# поднятие истории в коде, а не полагается на то, что модель сама вызовет инструмент.
+RECALL_PATTERN = re.compile(
+    r"вспом|помн|напомн|раньше|прошл|о чем|о чём|что обсужд|обсуждали|"
+    r"говорили|вчера|неделю|на прошлой|когда-то|было ли",
+    re.IGNORECASE,
+)
+RECALL_PAGES = 4
+RECALL_PAGE_SIZE = 50
+RECALL_STOPWORDS = {
+    "помнишь", "помните", "вспомни", "вспомнить", "напомни", "раньше", "прошлый",
+    "прошлом", "обсуждали", "говорили", "когда", "тогда", "этом", "чате", "мембу",
+    "вообще", "что", "как", "это", "про", "или", "если", "была", "были", "было",
+}
 
 
 class GeminiAgent:
@@ -1047,6 +1064,77 @@ class GeminiAgent:
         finally:
             self._style_running.discard(chat_id)
 
+    async def _recall_context(
+        self,
+        chat_id: int,
+        recent_messages: list[dict],
+    ) -> dict:
+        """Поднимает историю из базы, если последнее сообщение просит что-то вспомнить."""
+        trigger = next(
+            (
+                m for m in reversed(recent_messages)
+                if m.get("sender_name") != "Мембу" and m.get("text")
+            ),
+            None,
+        )
+
+        if trigger is None:
+            return {}
+
+        text = str(trigger.get("text", ""))
+
+        if not RECALL_PATTERN.search(text):
+            return {}
+
+        # Окно: несколько страниц назад, хронологически.
+        pages: list[dict] = []
+        before = None
+
+        try:
+            for _ in range(RECALL_PAGES):
+                rows, has_more = await asyncio.to_thread(
+                    self.storage.history_page,
+                    chat_id,
+                    before,
+                    RECALL_PAGE_SIZE,
+                )
+                pages = rows + pages
+
+                if not has_more or not rows:
+                    break
+
+                before = rows[0].get("created_at")
+
+            words = [
+                w for w in re.findall(r"[а-яёa-z0-9]{4,}", text.lower())
+                if w not in RECALL_STOPWORDS
+            ]
+
+            hits: list[dict] = []
+            if words:
+                hits = await asyncio.to_thread(
+                    self.storage.search_history,
+                    chat_id,
+                    " ".join(words[:3]),
+                    10,
+                    None,
+                )
+        except Exception:
+            logging.exception("Ошибка поднятия истории чата %s", chat_id)
+            return {}
+
+        def compact(row: dict) -> dict:
+            return {
+                "who": row.get("sender_name") or "",
+                "at": str(row.get("created_at", ""))[:16],
+                "text": str(row.get("text", ""))[:160],
+            }
+
+        return {
+            "window": [compact(r) for r in pages],
+            "keyword_hits": [compact(r) for r in hits],
+        }
+
     async def process(
         self,
         chat_id: int,
@@ -1066,6 +1154,8 @@ class GeminiAgent:
         self.maybe_refresh_style(chat_id)
         self.maybe_refresh_digest(chat_id)
 
+        recalled_history = await self._recall_context(chat_id, recent_messages)
+
         payload = {
             "chat_id": chat_id,
             "trigger": {
@@ -1074,6 +1164,7 @@ class GeminiAgent:
                 "branch_id": branch_id,
             },
             "bot_status": bot_status or {},
+            "recalled_history": recalled_history,
             "core_memories": core_memories[:MEMORY_IN_CONTEXT],
             "recent_messages": [
                 {**m, "text": str(m.get("text", ""))[:300]}
@@ -1104,6 +1195,12 @@ class GeminiAgent:
             "переданного контекста. Не угадывай идентификаторы. Предпочитай "
             "сообщения участников, а не собственные сообщения или сообщения других "
             "ботов. Не ставь реакцию на системные события о входе/выходе участников.\n\n"
+
+            "Если в контексте есть recalled_history, это история, уже поднятая из базы "
+            "под вопрос пользователя. window — последние сообщения по порядку, давние "
+            "сверху; keyword_hits — совпадения по словам из вопроса. Опирайся на неё и "
+            "отвечай по существу. Не говори «не помню», пока не посмотрел в recalled_history. "
+            "Если там пусто, честно скажи, что в базе этого не нашёл.\n\n"
 
             "История чата хранится по времени, и ты можешь её листать. Чтобы вспомнить, "
             "о чём говорили последнее время, вызови browse_chat_history без before: "
