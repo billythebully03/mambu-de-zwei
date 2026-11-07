@@ -1,8 +1,10 @@
 import asyncio
 import logging
 import os
+import math
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import Awaitable, Callable
 
@@ -10,7 +12,14 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
-from aiogram.types import ChatMemberUpdated, Message, User
+from aiogram.types import (
+    CallbackQuery,
+    ChatMemberUpdated,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    User,
+)
 
 from membu import MembuCore
 from storage import MembuStorage
@@ -63,6 +72,12 @@ IDLE_INITIATIVE_COOLDOWN_SECONDS = max(
 
 # Статус самого Мембу в каждом чате: in_chat или removed, кто и когда.
 BOT_IN_CHAT_STATUSES = {"member", "administrator", "creator"}
+
+# Команды управления доступны только в личке и только этому пользователю.
+OWNER_USERNAME = os.getenv("MEMBU_OWNER_USERNAME", "ibartyom").lower()
+MEMORY_PAGE_SIZE = 8
+DUBAI_TZ = timezone(timedelta(hours=4))
+STARTED_AT = datetime.now(timezone.utc)
 
 # Telegram показывает typing максимум 5 секунд. Обновляем чаще этого срока.
 TYPING_REFRESH_SECONDS = 4.0
@@ -216,7 +231,9 @@ async def chat_worker(chat_id: int, queue: asyncio.Queue) -> None:
                 fut.cancel()
             raise
 
-        except Exception:
+        except Exception as exc:
+            if agent is not None:
+                agent.note_api_error(exc)
             logging.exception("Ошибка при обработке очереди чата %s", chat_id)
             if not fut.done():
                 fut.set_result(None)
@@ -657,6 +674,209 @@ async def handle_membership_event(message: Message) -> None:
     )
 
 
+def is_owner_dm(user: User | None, chat_type: str) -> bool:
+    return bool(
+        user
+        and user.username
+        and chat_type == "private"
+        and user.username.lower() == OWNER_USERNAME
+    )
+
+
+def format_dubai(dt: datetime) -> str:
+    return dt.astimezone(DUBAI_TZ).strftime("%d.%m %H:%M")
+
+
+def memory_label(row: dict) -> str:
+    content = str(row.get("content", "")).replace("\n", " ")
+    people = row.get("people") or []
+    label = f"{', '.join(people)}: {content}" if people else content
+    return label if len(label) <= 60 else label[:59] + "…"
+
+
+async def memory_page_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
+    rows = await asyncio.to_thread(storage.list_all_memories, 500)
+
+    if not rows:
+        return (
+            "Настройка памяти\n\nМембу пока ничего не запомнил.",
+            InlineKeyboardMarkup(inline_keyboard=[]),
+        )
+
+    total_pages = math.ceil(len(rows) / MEMORY_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    chunk = rows[page * MEMORY_PAGE_SIZE:(page + 1) * MEMORY_PAGE_SIZE]
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                text=memory_label(row),
+                callback_data=f"mem:del:{row['id']}:{page}",
+            )
+        ]
+        for row in chunk
+    ]
+
+    keyboard.append([
+        InlineKeyboardButton(
+            text="◀",
+            callback_data=f"mem:page:{page - 1}" if page > 0 else "mem:noop",
+        ),
+        InlineKeyboardButton(
+            text=f"{page + 1}/{total_pages}",
+            callback_data="mem:noop",
+        ),
+        InlineKeyboardButton(
+            text="▶",
+            callback_data=(
+                f"mem:page:{page + 1}"
+                if page < total_pages - 1
+                else "mem:noop"
+            ),
+        ),
+    ])
+
+    text = (
+        "Настройка памяти\n\n"
+        "Ниже все-все логи, которые запомнил Мембу. "
+        "Нажми на запись, чтобы удалить её из памяти. "
+        f"Всего: {len(rows)}."
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+async def build_status_text() -> str:
+    now = datetime.now(timezone.utc)
+    lines = ["Статус Мембу"]
+
+    lines.append(f"Модель: {GEMINI_MODEL}")
+    lines.append(f"Запущен: {format_dubai(STARTED_AT)} (Дубай)")
+
+    last_ok = agent.last_ok_at if agent else None
+    lines.append(
+        "Последний успешный ответ модели: "
+        + (format_dubai(last_ok) if last_ok else "пока не было")
+    )
+
+    if agent and agent.quota_reset_at and agent.quota_reset_at > now:
+        lines.append(
+            "Лимит токенов исчерпан. Сбросится примерно: "
+            f"{format_dubai(agent.quota_reset_at)} (Дубай, UTC+4)."
+        )
+    else:
+        lines.append("Лимит токенов: переполнения сейчас нет.")
+
+    if agent and agent.last_error:
+        err = agent.last_error
+        lines.append(
+            f"Последняя ошибка ({format_dubai(err['at'])}): {err['message'][:200]}"
+        )
+    else:
+        lines.append("Последних ошибок нет.")
+
+    count = 0
+    if storage is not None:
+        count = len(await asyncio.to_thread(storage.list_all_memories, 1000))
+    lines.append(f"Воспоминаний: {count}")
+
+    return "\n".join(lines)
+
+
+@router.message(Command("memory"))
+async def memory_command(message: Message) -> None:
+    if not is_owner_dm(message.from_user, message.chat.type) or storage is None:
+        return
+
+    text, markup = await memory_page_view(0)
+    await message.answer(text, reply_markup=markup)
+
+
+@router.message(Command("clearall"))
+async def clearall_command(message: Message) -> None:
+    if not is_owner_dm(message.from_user, message.chat.type):
+        return
+
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Да, стереть всё", callback_data="clr:yes"),
+                InlineKeyboardButton(text="Отмена", callback_data="clr:no"),
+            ]
+        ]
+    )
+    await message.answer(
+        "Ты точно хочешь стереть воспоминания Мембу? Это нельзя будет отменить.",
+        reply_markup=markup,
+    )
+
+
+@router.message(Command("status"))
+async def status_command(message: Message) -> None:
+    if not is_owner_dm(message.from_user, message.chat.type):
+        return
+
+    await message.answer(await build_status_text())
+
+
+@router.callback_query(F.data.startswith("mem:") | F.data.startswith("clr:"))
+async def handle_owner_callbacks(callback: CallbackQuery) -> None:
+    message = callback.message
+
+    if message is None or not is_owner_dm(callback.from_user, message.chat.type):
+        await callback.answer()
+        return
+
+    parts = (callback.data or "").split(":")
+
+    try:
+        if parts[0] == "mem":
+            action = parts[1]
+
+            if action == "noop":
+                await callback.answer()
+                return
+
+            if action == "page":
+                page = int(parts[2])
+            elif action == "del":
+                memory_id = int(parts[2])
+                page = int(parts[3])
+                deleted_chat = await asyncio.to_thread(
+                    storage.delete_memory,
+                    memory_id,
+                )
+                if deleted_chat is not None:
+                    agent.invalidate_memory_cache(deleted_chat)
+                await callback.answer("Удалено из памяти")
+            else:
+                await callback.answer()
+                return
+
+            text, markup = await memory_page_view(page)
+            await message.edit_text(text, reply_markup=markup)
+            if action == "page":
+                await callback.answer()
+
+        elif parts[0] == "clr":
+            if parts[1] == "yes":
+                count = await asyncio.to_thread(storage.delete_all_memories)
+                agent.invalidate_memory_cache()
+                await message.edit_text(
+                    f"Воспоминания стёрты: {count}. Личность Мембу на месте."
+                )
+            else:
+                await message.edit_text(
+                    "Отменено. Воспоминания на месте."
+                )
+            await callback.answer()
+
+    except TelegramAPIError as exc:
+        # Например, «message is not modified», если страница не изменилась.
+        logging.debug("Кнопка управления памятью: %s", exc)
+    except (ValueError, IndexError):
+        await callback.answer("Не понял кнопку.")
+
+
 @router.message()
 async def handle_message(message: Message) -> None:
     global bot_user, storage
@@ -679,6 +899,23 @@ async def handle_message(message: Message) -> None:
 
     text = message.text or message.caption or ""
     if not text.strip():
+        if message.sticker is not None and storage is not None:
+            # Стикер — немой ответ: сохраняем как «[стикер]» и ИИ не запускаем.
+            await asyncio.to_thread(
+                storage.add_message,
+                {
+                    "chat_id": chat_id,
+                    "message_id": message.message_id,
+                    "sender_id": message.from_user.id,
+                    "sender_name": message.from_user.full_name or "",
+                    "username": message.from_user.username or "",
+                    "text": "[стикер]",
+                    "reply_to_user_id": None,
+                    "reply_to_message_id": None,
+                    "branch_id": None,
+                    "ts": message.date.timestamp(),
+                },
+            )
         return
 
     mentioned = is_mentioned(message, bot_user)

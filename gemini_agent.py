@@ -3,8 +3,10 @@ import json
 import logging
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
+from zoneinfo import ZoneInfo
 
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import ReactionTypeEmoji
@@ -146,6 +148,29 @@ RECALL_STOPWORDS = {
 }
 
 
+def quota_reset_time(text: str, now: datetime) -> datetime:
+    """Когда примерно снимется лимит: по подсказке API или в полночь по Pacific."""
+    match = re.search(
+        r"retry(?:Delay)?\D{0,12}?(\d+(?:\.\d+)?)\s*s",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return now + timedelta(seconds=float(match.group(1)) + 5)
+
+    # Квоты Gemini обычно обнуляются в полночь по тихоокеанскому времени.
+    try:
+        pacific = ZoneInfo("America/Los_Angeles")
+    except Exception:
+        pacific = timezone(timedelta(hours=-8))
+
+    local_now = now.astimezone(pacific)
+    midnight = (local_now + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return midnight.astimezone(timezone.utc)
+
+
 class GeminiAgent:
     def __init__(
         self,
@@ -174,6 +199,11 @@ class GeminiAgent:
 
         # Удерживаем ссылки на фоновые задачи, чтобы их не собрал GC.
         self._background: set[asyncio.Task] = set()
+
+        # Состояние для /status: успешные ответы и последняя ошибка API.
+        self.last_ok_at: datetime | None = None
+        self.last_error: dict | None = None
+        self.quota_reset_at: datetime | None = None
 
         # Дайджест памяти: аналогичные проверка и защита от параллельного запуска.
         self._digest_checked_at: dict[int, float] = {}
@@ -853,11 +883,9 @@ class GeminiAgent:
                     "error": str(exc)[:350],
                 }
 
-            log_text = (
-                f"[СТИКЕР: {key}] "
-                f"{sticker['description']} "
-                f"Значение: {sticker['meaning']}"
-            )
+            # Стикер — немой ответ. В истории не пишем ключ и смысл,
+            # иначе модель начинает обсуждать тему стикера.
+            log_text = "[стикер]"
 
             await self._store_bot_message(
                 chat_id,
@@ -1056,7 +1084,8 @@ class GeminiAgent:
                     result.get("observed_messages"),
                 )
 
-        except Exception:
+        except Exception as exc:
+            self.note_api_error(exc)
             logging.exception(
                 "Ошибка обновления стиля чата %s", chat_id
             )
@@ -1189,6 +1218,9 @@ class GeminiAgent:
             "key из каталога. Стикер может быть самостоятельной репликой без текста. "
             "Не отправляй его вместе с текстом, если оба элемента не дают разного "
             "содержания. Обычно выбирай один способ: текст, стикер или реакцию.\n\n"
+            "Стикер — короткий немой ответ без слов. В истории стикеры записаны просто "
+            "как «[стикер]». Не обсуждай их смысл, не продолжай тему стикера и не говори "
+            "о рыбе, базаре или других темах из каталога, если их никто не поднимал.\n\n"
 
             "Если достаточно реакции на конкретное сообщение, можешь вызвать "
             "send_reaction. Для реакции используй только точный message_id из "
@@ -1291,6 +1323,8 @@ class GeminiAgent:
                 contents=contents,
                 config=self.config,
             )
+
+            self.last_ok_at = datetime.now(timezone.utc)
 
             calls = response.function_calls or []
 
@@ -1458,8 +1492,26 @@ class GeminiAgent:
                 len(items),
             )
 
-        except Exception:
+        except Exception as exc:
+            self.note_api_error(exc)
             logging.exception("Ошибка дайджеста памяти чата %s", chat_id)
 
         finally:
             self._digest_running.discard(chat_id)
+
+    def note_api_error(self, exc: Exception) -> None:
+        """Запоминает последнюю ошибку API и лимит, чтобы показать в /status."""
+        now = datetime.now(timezone.utc)
+        text = str(exc)
+        self.last_error = {"at": now, "message": text[:300]}
+
+        lowered = text.lower()
+        if "resource_exhausted" in lowered or "429" in text or "quota" in lowered:
+            self.quota_reset_at = quota_reset_time(text, now)
+
+    def invalidate_memory_cache(self, chat_id: int | None = None) -> None:
+        """Сбрасывает кэш памяти после удаления записей из базы."""
+        if chat_id is None:
+            self._memory_cache.clear()
+        else:
+            self._memory_cache.pop(chat_id, None)

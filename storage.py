@@ -401,3 +401,35 @@ class MembuStorage:
                 break
 
         return {"status": status, "changed_at": changed_at, "by": by}
+
+    def list_all_memories(self, limit: int = 500) -> list[dict]:
+        """Все воспоминания бота из всех чатов, свежие сверху."""
+        result = (
+            self.client.table("membu_memories")
+            .select("id,chat_id,category,content,people,importance,updated_at")
+            .order("updated_at", desc=True)
+            .limit(max(1, min(limit, 1000)))
+            .execute()
+        )
+        return result.data or []
+
+    def delete_memory(self, memory_id: int) -> int | None:
+        """Удаляет одно воспоминание. Возвращает chat_id, чтобы сбросить кэш."""
+        result = (
+            self.client.table("membu_memories")
+            .delete()
+            .eq("id", memory_id)
+            .execute()
+        )
+        rows = result.data or []
+        return int(rows[0]["chat_id"]) if rows else None
+
+    def delete_all_memories(self) -> int:
+        """Стирает все воспоминания. Личность (PERSONALITY.md) не трогает."""
+        result = (
+            self.client.table("membu_memories")
+            .delete()
+            .gte("id", 0)
+            .execute()
+        )
+        return len(result.data or [])
