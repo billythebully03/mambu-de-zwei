@@ -819,6 +819,15 @@ async def build_status_text() -> str:
         + (format_dubai(last_ok) if last_ok else "пока не было")
     )
 
+    if agent and agent.using_backup:
+        since = format_dubai(agent.switched_at) if agent.switched_at else "—"
+        lines.append(
+            f"Ключ: работает РЕЗЕРВНЫЙ ключ с {since} (Дубай). "
+            "Основной вернётся сам примерно через 30 минут, если начнёт отвечать."
+        )
+    else:
+        lines.append("Ключ: основной.")
+
     if agent and agent.quota_reset_at and agent.quota_reset_at > now:
         lines.append(
             "Лимит токенов исчерпан. Сбросится примерно: "

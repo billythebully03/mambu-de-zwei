@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -42,6 +43,21 @@ STYLE_CHECK_INTERVAL_SECONDS = 60
 # Сколько последних сообщений (людей и Мембу) отдаём аналитику стиля.
 STYLE_SAMPLE_SIZE = 100
 MAX_CHAT_ACTIONS_PER_TURN = 15
+PRIMARY_RETRY_SECONDS = 1800
+
+
+def _should_failover(exc: Exception) -> bool:
+    """Переключаемся на резерв при квоте, отказе в доступе или неверном ключе."""
+    code = getattr(exc, "code", None)
+    text = str(exc).lower()
+
+    if code in (401, 403, 429):
+        return True
+
+    return any(
+        marker in text
+        for marker in ("resource_exhausted", "quota", "api key", "permission denied", "429")
+    )
 CHAT_ACTION_PAUSE_SECONDS = 1.0
 
 # Кэш памяти из Supabase: как долго держим его без перезагрузки.
@@ -298,7 +314,15 @@ class GeminiAgent:
         model: str = "gemini-3.5-flash-lite",
         activity_callback: Callable[[int], None] | None = None,
     ):
-        self.client = genai.Client(api_key=api_key)
+        # Основной ключ и резервный (GEMINI_BACKUP_API_KEY). Переключаемся на резерв,
+        # когда основной отваливается по квоте или ключу; основной пробуем снова позже.
+        self._clients = [genai.Client(api_key=api_key)]
+        backup_key = os.getenv("GEMINI_BACKUP_API_KEY", "").strip()
+        if backup_key and backup_key != (api_key or ""):
+            self._clients.append(genai.Client(api_key=backup_key))
+        self._active = 0
+        self.switched_at: datetime | None = None
+        self.last_failover_reason: str = ""
         self.storage = storage
         self.bot = bot
         self.bot_user = bot_user
@@ -1183,7 +1207,7 @@ class GeminiAgent:
             )
 
             response = await asyncio.to_thread(
-                self.client.models.generate_content,
+                self._generate,
                 model=self.model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
@@ -1354,6 +1378,11 @@ class GeminiAgent:
             "нечего добавить, а не потому что неудобно влезать. Это не обязанность. "
             "Инициатива — конкретный ход, а не филлер «ну». Выводы делай только из сказанного.\n\n"
 
+            "Сложный набор сообщений: если сразу пишут много людей или сообщения сложные, "
+            "не обязан отвечать на каждое только ради ответа. Можно промолчать, подождать "
+            "и ответить через пару сообщений, но предметнее. Можно и отвечать на каждое. "
+            "Решай сам.\n\n"
+
             "Поток мыслей: если в payload есть active_burst, человек, скорее всего, пишет "
             "несколькими сообщениями подряд. Не отвечай на первую часть. Если мысль явно не "
             "закончена (обрывается, «и», «а», «короче», многоточие), промолчи и дождись "
@@ -1505,7 +1534,7 @@ class GeminiAgent:
                 return
 
             response = await asyncio.to_thread(
-                self.client.models.generate_content,
+                self._generate,
                 model=self.model,
                 contents=contents,
                 config=self.config,
@@ -1637,7 +1666,7 @@ class GeminiAgent:
             ]
 
             response = await asyncio.to_thread(
-                self.client.models.generate_content,
+                self._generate,
                 model=self.model,
                 contents=(
                     "Переписка (json):\n"
@@ -1683,6 +1712,45 @@ class GeminiAgent:
 
         finally:
             self._digest_running.discard(chat_id)
+
+    @property
+    def using_backup(self) -> bool:
+        return self._active == 1
+
+    def _generate(self, **kwargs):
+        """Вызов модели с переключением на резервный ключ при квоте или ошибке ключа.
+        Тот же запрос повторяется на резервном ключе, контекст и память не теряются."""
+        now = datetime.now(timezone.utc)
+
+        if (
+            self._active == 1
+            and self.switched_at
+            and (now - self.switched_at).total_seconds() > PRIMARY_RETRY_SECONDS
+        ):
+            self._active = 0
+
+        order = [self._active] + [i for i in range(len(self._clients)) if i != self._active]
+        last_exc: Exception | None = None
+
+        for index in order:
+            try:
+                response = self._clients[index].models.generate_content(**kwargs)
+            except Exception as exc:
+                last_exc = exc
+                if not _should_failover(exc) or index == order[-1]:
+                    raise
+                self._active = (index + 1) % len(self._clients)
+                self.switched_at = datetime.now(timezone.utc)
+                self.last_failover_reason = str(exc)[:200]
+                logging.warning("MEMBU_KEY | переключение на резервный ключ: %s", exc)
+                continue
+
+            if index != self._active:
+                self._active = index
+                self.switched_at = datetime.now(timezone.utc)
+            return response
+
+        raise last_exc or RuntimeError("Нет доступных ключей Gemini")
 
     def note_api_error(self, exc: Exception) -> None:
         """Запоминает последнюю ошибку API и лимит, чтобы показать в /status."""
@@ -1815,7 +1883,7 @@ class GeminiAgent:
                 current_opinion = (current or {}).get("opinion") or "нет"
 
                 response = await asyncio.to_thread(
-                    self.client.models.generate_content,
+                    self._generate,
                     model=self.model,
                     contents=(
                         f"Человек: {names[pid]}\n"
