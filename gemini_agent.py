@@ -1540,6 +1540,13 @@ class GeminiAgent:
         if "resource_exhausted" in lowered or "429" in text or "quota" in lowered:
             self.quota_reset_at = quota_reset_time(text, now)
 
+    def reset_session_state(self) -> None:
+        """Сбрасывает сессионную память ИИ: кэши и таймеры фоновых анализов.
+        Стиль и мнения о людях не трогает."""
+        self._memory_cache.clear()
+        self._digest_checked_at.clear()
+        self._people_cache.clear()
+
     def invalidate_memory_cache(self, chat_id: int | None = None) -> None:
         """Сбрасывает кэш памяти после удаления записей из базы."""
         if chat_id is None:

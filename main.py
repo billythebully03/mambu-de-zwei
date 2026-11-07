@@ -856,7 +856,9 @@ async def clearall_command(message: Message) -> None:
         ]
     )
     await message.answer(
-        "Ты точно хочешь стереть воспоминания Мембу? Это нельзя будет отменить.",
+        "Ты точно хочешь стереть воспоминания Мембу? Будет стёрто: обычные воспоминания "
+        "(важность 1–3), вся история сообщений, сессионная память ИИ. Важные воспоминания "
+        "(важность 4–5) и личность Мембу останутся. Это нельзя будет отменить.",
         reply_markup=markup,
     )
 
@@ -1076,10 +1078,17 @@ async def handle_owner_callbacks(callback: CallbackQuery) -> None:
 
         if kind == "clr":
             if parts[1] == "yes":
-                count = await asyncio.to_thread(storage.delete_all_memories)
-                agent.invalidate_memory_cache()
+                memories = await asyncio.to_thread(storage.delete_unimportant_memories, 4)
+                messages = await asyncio.to_thread(storage.delete_all_messages)
+                branches = await asyncio.to_thread(storage.close_all_branches)
+                await asyncio.to_thread(storage.reset_digest_counts)
+                agent.reset_session_state()
                 await message.edit_text(
-                    f"Воспоминания стёрты: {count}. Личность Мембу на месте."
+                    "Готово.\n"
+                    f"Обычных воспоминаний стёрто: {memories}\n"
+                    f"Сообщений стёрто: {messages}\n"
+                    f"Веток разговора закрыто: {branches}\n\n"
+                    "Важные воспоминания (4–5) и личность Мембу на месте."
                 )
             else:
                 await message.edit_text("Отменено. Воспоминания на месте.")

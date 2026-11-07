@@ -424,15 +424,45 @@ class MembuStorage:
         rows = result.data or []
         return int(rows[0]["chat_id"]) if rows else None
 
-    def delete_all_memories(self) -> int:
-        """Стирает все воспоминания. Личность (PERSONALITY.md) не трогает."""
+    def delete_unimportant_memories(self, keep_from_importance: int = 4) -> int:
+        """Стирает только не важные воспоминания (важность ниже порога).
+        Важные (4 и 5) и личность (PERSONALITY.md) не трогает."""
         result = (
             self.client.table("membu_memories")
             .delete()
-            .gte("id", 0)
+            .lt("importance", keep_from_importance)
             .execute()
         )
         return len(result.data or [])
+
+    def delete_all_messages(self) -> int:
+        """Стирает историю сообщений всех чатов (общая память)."""
+        result = (
+            self.client.table("membu_messages")
+            .delete()
+            .neq("chat_id", 0)
+            .execute()
+        )
+        return len(result.data or [])
+
+    def close_all_branches(self) -> int:
+        """Закрывает все ветки разговоров (сессионная память ИИ)."""
+        result = (
+            self.client.table("membu_branches")
+            .delete()
+            .neq("branch_id", "")
+            .execute()
+        )
+        return len(result.data or [])
+
+    def reset_digest_counts(self) -> None:
+        """Сбрасывает счётчик дайджеста: после стирания сообщений считать заново."""
+        (
+            self.client.table("membu_chat_profiles")
+            .update({"last_digested_count": 0})
+            .neq("chat_id", 0)
+            .execute()
+        )
 
     def get_memory(self, memory_id: int) -> dict | None:
         """Одна запись памяти для подробного просмотра."""
