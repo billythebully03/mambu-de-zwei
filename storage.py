@@ -445,3 +445,96 @@ class MembuStorage:
         )
         rows = result.data or []
         return rows[0] if rows else None
+
+    def list_messages_page(self, page: int, size: int) -> tuple[list[dict], int]:
+        """Все сообщения из базы, от новых к старым, с общим количеством."""
+        start = max(0, page) * size
+        result = (
+            self.client.table("membu_messages")
+            .select(
+                "message_id,chat_id,sender_name,text,created_at",
+                count="exact",
+            )
+            .order("created_at", desc=True)
+            .range(start, start + size - 1)
+            .execute()
+        )
+        return result.data or [], int(result.count or 0)
+
+    def get_message(self, chat_id: int, message_id: int) -> dict | None:
+        result = (
+            self.client.table("membu_messages")
+            .select("message_id,chat_id,sender_name,text,created_at")
+            .eq("chat_id", chat_id)
+            .eq("message_id", message_id)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        return rows[0] if rows else None
+
+    def delete_message(self, chat_id: int, message_id: int) -> bool:
+        result = (
+            self.client.table("membu_messages")
+            .delete()
+            .eq("chat_id", chat_id)
+            .eq("message_id", message_id)
+            .execute()
+        )
+        return bool(result.data)
+
+    def list_people_page(self, page: int, size: int) -> tuple[list[dict], int]:
+        start = max(0, page) * size
+        result = (
+            self.client.table("membu_people")
+            .select(
+                "chat_id,person_id,display_name,opinion,message_count,updated_at",
+                count="exact",
+            )
+            .order("updated_at", desc=True)
+            .range(start, start + size - 1)
+            .execute()
+        )
+        return result.data or [], int(result.count or 0)
+
+    def get_person(self, chat_id: int, person_id: int) -> dict | None:
+        result = (
+            self.client.table("membu_people")
+            .select("chat_id,person_id,display_name,opinion,message_count,updated_at")
+            .eq("chat_id", chat_id)
+            .eq("person_id", person_id)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        return rows[0] if rows else None
+
+    def list_people_for_chat(self, chat_id: int, limit: int = 200) -> list[dict]:
+        result = (
+            self.client.table("membu_people")
+            .select("person_id,display_name,opinion")
+            .eq("chat_id", chat_id)
+            .limit(max(1, min(limit, 500)))
+            .execute()
+        )
+        return result.data or []
+
+    def upsert_person(
+        self,
+        chat_id: int,
+        person_id: int,
+        display_name: str,
+        opinion: str,
+        message_count: int,
+    ) -> None:
+        self.client.table("membu_people").upsert(
+            {
+                "chat_id": chat_id,
+                "person_id": person_id,
+                "display_name": display_name[:200],
+                "opinion": opinion[:800],
+                "message_count": message_count,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            on_conflict="chat_id,person_id",
+        ).execute()

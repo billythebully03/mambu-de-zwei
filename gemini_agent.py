@@ -50,15 +50,17 @@ MEMORY_IN_CONTEXT = 40
 STYLE_CACHE_TTL_SECONDS = 300
 
 STYLE_ANALYST_INSTRUCTION = (
-    "Ты анализируешь переписку Telegram-чата и ведёшь его профиль манеры общения. "
-    "Опиши коллективный стиль: темп и длину сообщений, юмор, сленг, эмодзи, "
-    "степень формальности, частые приёмы. Отдельно отметь, как звучит Мембу "
-    "(участник с who = \"Мембу\"): что выглядит естественно для этой компании, "
-    "а что лишнее, повторяющееся или неуместное, и как Мембу мог бы говорить "
-    "органичнее, сохраняя свой характер. Если дан текущий профиль, обнови его, "
-    "а не переписывай с нуля. Опирайся только на то, что реально видно в переписке. "
-    "Не выдумывай закономерностей. Не указывай имена участников и не пересказывай "
-    "личные сведения. Пиши простым текстом, до 2000 символов, без markdown."
+    "Ты ведёшь профиль манеры общения Мембу в этом чате. Мембу — персонаж с "
+    "постоянным характером (он описан в PERSONALITY), характер не меняется. "
+    "Меняется только подача, чтобы он звучал как участник этой компании. "
+    "Сначала коротко опиши нормы чата: длину сообщений, сленг, эмодзи, юмор, "
+    "формальность. Затем раздел «Подстройка Мембу»: до 5 пунктов, каждый — "
+    "умеренный шаг от текущей манеры Мембу к нормам чата, например «реже ставить "
+    "эмодзи», «короче реплики в живой перепалке», «можно мягкий сленг». Не предлагай "
+    "смены характера, роли или имени, не отменяй то, что уже задано. Если дан "
+    "текущий профиль, двигайся от него, а не переписывай с нуля. Опирайся только на "
+    "переписку, не выдумывай закономерностей. Не указывай имена участников и личные "
+    "сведения. Простой текст, до 2000 символов, без markdown."
 )
 
 # Дайджест: раз в столько новых сообщений модель выделяет из переписки
@@ -148,6 +150,23 @@ RECALL_STOPWORDS = {
 }
 
 
+# Мнения о людях: раз в полчаса смотрим на самых активных участников.
+PEOPLE_CHECK_INTERVAL_SECONDS = 1800
+PEOPLE_WINDOW = 150
+PEOPLE_MAX_PER_RUN = 4
+PEOPLE_MIN_MESSAGES = 5
+
+PEOPLE_OPINION_INSTRUCTION = (
+    "Ты пишешь короткое мнение Мембу о конкретном участнике Telegram-чата. Опирайся "
+    "только на переписку: как человек общается, что любит, о чём говорит, как "
+    "относится к другим. Пиши от первого лица Мембу, 2–4 предложения, спокойно и "
+    "по-человечески, без оценок внешности и без выдуманных фактов. Если есть текущее "
+    "мнение, обнови его, а не переписывай с нуля. Не записывай здоровье, религию, "
+    "сексуальные темы, финансы, документы и другие чувствительные сведения. Простой "
+    "текст, до 800 символов, без markdown."
+)
+
+
 def quota_reset_time(text: str, now: datetime) -> datetime:
     """Когда примерно снимется лимит: по подсказке API или в полночь по Pacific."""
     match = re.search(
@@ -204,6 +223,11 @@ class GeminiAgent:
         self.last_ok_at: datetime | None = None
         self.last_error: dict | None = None
         self.quota_reset_at: datetime | None = None
+
+        # Мнения о людях: кэш и защита от параллельного запуска.
+        self._people_cache: dict[int, tuple[float, dict]] = {}
+        self._people_checked_at: dict[int, float] = {}
+        self._people_running: set[int] = set()
 
         # Дайджест памяти: аналогичные проверка и защита от параллельного запуска.
         self._digest_checked_at: dict[int, float] = {}
@@ -1182,8 +1206,10 @@ class GeminiAgent:
         # Профиль стиля пересобирается в фоне, сам ответ не ждёт его.
         self.maybe_refresh_style(chat_id)
         self.maybe_refresh_digest(chat_id)
+        self.maybe_refresh_people(chat_id)
 
         recalled_history = await self._recall_context(chat_id, recent_messages)
+        people_notes = await self._people_notes_for(chat_id, recent_messages)
 
         payload = {
             "chat_id": chat_id,
@@ -1194,6 +1220,7 @@ class GeminiAgent:
             },
             "bot_status": bot_status or {},
             "recalled_history": recalled_history,
+            "people_notes": people_notes,
             "core_memories": core_memories[:MEMORY_IN_CONTEXT],
             "recent_messages": [
                 {**m, "text": str(m.get("text", ""))[:300]}
@@ -1270,6 +1297,10 @@ class GeminiAgent:
             "новости или личные события. Повод часто лежит в core_memories: незакрытая "
             "тема, обещание, внутренняя шутка. Если нашёл такой повод, начинай разговор "
             "охотнее. Если повода нет, промолчи.\n\n"
+
+            "В people_notes — твоё мнение о людях, которые сейчас в разговоре. Учитывай "
+            "его тихо, на подачу. Не говори человеку напрямую «я о тебе думаю…» и не "
+            "пересказывай мнение, если тебя не спросили.\n\n"
 
             "Если trigger.reason равен bot_added, тебя только что добавили в этот чат. "
             "Кто добавил, видно в истории по событию [СОБЫТИЕ ЧАТА] и в bot_status. "
@@ -1515,3 +1546,148 @@ class GeminiAgent:
             self._memory_cache.clear()
         else:
             self._memory_cache.pop(chat_id, None)
+
+    async def _people_notes_for(self, chat_id: int, recent_messages: list[dict]) -> dict:
+        """Мнения о людях, которые сейчас в разговоре. Кэш на несколько минут."""
+        now = time.monotonic()
+        cached = self._people_cache.get(chat_id)
+
+        if cached and now - cached[0] < MEMORY_CACHE_TTL_SECONDS:
+            notes = cached[1]
+        else:
+            try:
+                rows = await asyncio.to_thread(
+                    self.storage.list_people_for_chat,
+                    chat_id,
+                    200,
+                )
+            except Exception:
+                logging.exception("Не удалось загрузить мнения о людях: %s", chat_id)
+                rows = []
+
+            notes = {int(r["person_id"]): r for r in rows}
+            self._people_cache[chat_id] = (now, notes)
+
+        present = {
+            m.get("sender_id")
+            for m in recent_messages
+            if m.get("sender_id") and m.get("sender_name") != "Мембу"
+        }
+
+        return {
+            str(pid): {
+                "name": notes[pid].get("display_name", ""),
+                "opinion": notes[pid].get("opinion", ""),
+            }
+            for pid in present
+            if pid in notes
+        }
+
+    def maybe_refresh_people(self, chat_id: int) -> None:
+        now = time.monotonic()
+        last = self._people_checked_at.get(chat_id, 0.0)
+
+        if now - last < PEOPLE_CHECK_INTERVAL_SECONDS:
+            return
+
+        self._people_checked_at[chat_id] = now
+
+        if chat_id in self._people_running:
+            return
+
+        task = asyncio.create_task(self.refresh_people_opinions(chat_id))
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    async def refresh_people_opinions(self, chat_id: int) -> None:
+        if chat_id in self._people_running:
+            return
+
+        self._people_running.add(chat_id)
+
+        try:
+            messages = await asyncio.to_thread(
+                self.storage.recent_messages,
+                chat_id,
+                PEOPLE_WINDOW,
+            )
+
+            counts: dict[int, int] = {}
+            names: dict[int, str] = {}
+
+            for m in messages:
+                pid = m.get("sender_id")
+                if not pid or m.get("sender_name") == "Мембу":
+                    continue
+                counts[pid] = counts.get(pid, 0) + 1
+                names[pid] = m.get("sender_name") or "участник"
+
+            top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+            top = top[:PEOPLE_MAX_PER_RUN]
+
+            sample = [
+                {
+                    "who": (
+                        "Мембу"
+                        if m.get("sender_name") == "Мембу"
+                        else (m.get("sender_name") or "участник")
+                    ),
+                    "text": str(m.get("text", ""))[:300],
+                }
+                for m in messages
+            ]
+
+            for pid, cnt in top:
+                if cnt < PEOPLE_MIN_MESSAGES:
+                    continue
+
+                current = await asyncio.to_thread(
+                    self.storage.get_person,
+                    chat_id,
+                    pid,
+                )
+                current_opinion = (current or {}).get("opinion") or "нет"
+
+                response = await asyncio.to_thread(
+                    self.client.models.generate_content,
+                    model=self.model,
+                    contents=(
+                        f"Человек: {names[pid]}\n"
+                        f"Текущее мнение: {current_opinion}\n\n"
+                        "Переписка (json):\n"
+                        + json.dumps(sample, ensure_ascii=False)
+                    ),
+                    config=types.GenerateContentConfig(
+                        system_instruction=PEOPLE_OPINION_INSTRUCTION,
+                        temperature=0.4,
+                        max_output_tokens=400,
+                    ),
+                )
+
+                opinion = (response.text or "").strip()[:800]
+                if not opinion:
+                    continue
+
+                await asyncio.to_thread(
+                    self.storage.upsert_person,
+                    chat_id,
+                    pid,
+                    names[pid],
+                    opinion,
+                    cnt,
+                )
+
+            self._people_cache.pop(chat_id, None)
+
+            logging.info(
+                "MEMBU_PEOPLE | chat=%s | updated=%s",
+                chat_id,
+                len(top),
+            )
+
+        except Exception as exc:
+            self.note_api_error(exc)
+            logging.exception("Ошибка обновления мнений о людях: %s", chat_id)
+
+        finally:
+            self._people_running.discard(chat_id)

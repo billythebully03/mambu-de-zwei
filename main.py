@@ -701,7 +701,7 @@ async def memory_page_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
     if not rows:
         return (
             "Настройка памяти\n\nМембу пока ничего не запомнил.",
-            InlineKeyboardMarkup(inline_keyboard=[]),
+            InlineKeyboardMarkup(inline_keyboard=[tabs_row("mem")]),
         )
 
     total_pages = math.ceil(len(rows) / MEMORY_PAGE_SIZE)
@@ -718,6 +718,7 @@ async def memory_page_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
         for row in chunk
     ]
 
+    keyboard.insert(0, tabs_row("mem"))
     keyboard.append([
         InlineKeyboardButton(
             text="◀",
@@ -738,8 +739,8 @@ async def memory_page_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
     ])
 
     text = (
-        "Настройка памяти · Общая память\n\n"
-        "Ниже все-все логи, которые запомнил Мембу. "
+        "Настройка памяти · Основные\n\n"
+        "Правила и выводы, которые запомнил Мембу. "
         "Нажми на запись, чтобы открыть её полностью, удалить или вернуться назад. "
         f"Всего: {len(rows)}."
     )
@@ -868,7 +869,190 @@ async def status_command(message: Message) -> None:
     await message.answer(await build_status_text())
 
 
-@router.callback_query(F.data.startswith("mem:") | F.data.startswith("clr:"))
+def tabs_row(active: str) -> list[InlineKeyboardButton]:
+    def label(name: str, text: str) -> str:
+        return ("• " if active == name else "") + text
+
+    return [
+        InlineKeyboardButton(text=label("mem", "Основные"), callback_data="tab:mem"),
+        InlineKeyboardButton(text=label("msg", "Все сообщения"), callback_data="tab:msg"),
+    ]
+
+
+def nav_row(prefix: str, page: int, total_pages: int) -> list[InlineKeyboardButton]:
+    return [
+        InlineKeyboardButton(
+            text="◀",
+            callback_data=f"{prefix}:page:{page - 1}" if page > 0 else f"{prefix}:noop",
+        ),
+        InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data=f"{prefix}:noop"),
+        InlineKeyboardButton(
+            text="▶",
+            callback_data=(
+                f"{prefix}:page:{page + 1}" if page < total_pages - 1 else f"{prefix}:noop"
+            ),
+        ),
+    ]
+
+
+def short_label(prefix: str, text: str) -> str:
+    label = f"{prefix}{text}".replace("\n", " ")
+    return label if len(label) <= 60 else label[:59] + "…"
+
+
+async def message_page_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
+    rows, total = await asyncio.to_thread(
+        storage.list_messages_page, max(0, page), MEMORY_PAGE_SIZE
+    )
+    if total and not rows:
+        page = math.ceil(total / MEMORY_PAGE_SIZE) - 1
+        rows, total = await asyncio.to_thread(
+            storage.list_messages_page, page, MEMORY_PAGE_SIZE
+        )
+
+    total_pages = max(1, math.ceil(total / MEMORY_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+
+    keyboard = [tabs_row("msg")]
+    for row in rows:
+        label = short_label(
+            f"{row.get('sender_name') or 'участник'}: ",
+            str(row.get("text") or ""),
+        )
+        keyboard.append([
+            InlineKeyboardButton(
+                text=label,
+                callback_data=f"msg:view:{row['chat_id']}:{row['message_id']}:{page}",
+            )
+        ])
+
+    if total:
+        keyboard.append(nav_row("msg", page, total_pages))
+        text = (
+            "Настройка памяти · Все сообщения\n\n"
+            "Все сообщения из базы, от новых к старым. Нажми на сообщение, чтобы открыть "
+            f"его полностью или удалить. Всего: {total}."
+        )
+    else:
+        text = "Настройка памяти · Все сообщения\n\nВ базе пока нет сообщений."
+
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+async def message_detail_view(
+    chat_id: int,
+    message_id: int,
+    page: int,
+) -> tuple[str, InlineKeyboardMarkup] | None:
+    row = await asyncio.to_thread(storage.get_message, chat_id, message_id)
+    if row is None:
+        return None
+
+    when = parse_db_time(row.get("created_at"))
+    when_text = format_dubai(when) if when else "—"
+
+    text = (
+        f"Сообщение #{row.get('message_id')}\n"
+        f"От: {row.get('sender_name') or 'участник'}\n"
+        f"Чат: {row.get('chat_id')}\n"
+        f"Время: {when_text} (Дубай)\n\n"
+        f"{str(row.get('text') or '')[:3500]}"
+    )
+
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Удалить",
+                    callback_data=f"msg:del:{chat_id}:{message_id}:{page}",
+                ),
+                InlineKeyboardButton(text="Назад", callback_data=f"msg:page:{page}"),
+            ]
+        ]
+    )
+    return text, markup
+
+
+async def people_page_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
+    rows, total = await asyncio.to_thread(
+        storage.list_people_page, max(0, page), MEMORY_PAGE_SIZE
+    )
+    if total == 0:
+        return (
+            "Мнений о людях пока нет. Мембу формирует их по ходу общения.",
+            InlineKeyboardMarkup(inline_keyboard=[]),
+        )
+
+    total_pages = math.ceil(total / MEMORY_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    if not rows:
+        rows, total = await asyncio.to_thread(
+            storage.list_people_page, page, MEMORY_PAGE_SIZE
+        )
+
+    keyboard = []
+    for row in rows:
+        label = short_label(
+            f"{row.get('display_name') or 'участник'}: ",
+            str(row.get("opinion") or ""),
+        )
+        keyboard.append([
+            InlineKeyboardButton(
+                text=label,
+                callback_data=f"ppl:view:{row['chat_id']}:{row['person_id']}:{page}",
+            )
+        ])
+    keyboard.append(nav_row("ppl", page, total_pages))
+
+    text = (
+        "Мнение Мембу о людях\n\n"
+        "Нажми на человека, чтобы прочитать мнение целиком. "
+        f"Всего: {total}."
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+async def person_detail_view(
+    chat_id: int,
+    person_id: int,
+    page: int,
+) -> tuple[str, InlineKeyboardMarkup] | None:
+    row = await asyncio.to_thread(storage.get_person, chat_id, person_id)
+    if row is None:
+        return None
+
+    updated = parse_db_time(row.get("updated_at"))
+    updated_text = format_dubai(updated) if updated else "—"
+
+    text = (
+        f"{row.get('display_name') or 'участник'}\n"
+        f"Чат: {row.get('chat_id')}\n"
+        f"Сообщений в недавней переписке: {row.get('message_count')}\n"
+        f"Обновлено: {updated_text} (Дубай)\n\n"
+        "Мнение Мембу:\n"
+        f"{row.get('opinion') or '—'}"
+    )
+
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Назад", callback_data=f"ppl:page:{page}")]
+        ]
+    )
+    return text, markup
+
+
+@router.message(Command("people"))
+async def people_command(message: Message) -> None:
+    if not is_owner_dm(message.from_user, message.chat.type) or storage is None:
+        return
+
+    text, markup = await people_page_view(0)
+    await message.answer(text, reply_markup=markup)
+
+
+@router.callback_query(
+    F.data.startswith(("mem:", "msg:", "ppl:", "tab:", "clr:"))
+)
 async def handle_owner_callbacks(callback: CallbackQuery) -> None:
     message = callback.message
 
@@ -879,7 +1063,30 @@ async def handle_owner_callbacks(callback: CallbackQuery) -> None:
     parts = (callback.data or "").split(":")
 
     try:
-        if parts[0] == "mem":
+        kind = parts[0]
+
+        if kind == "tab":
+            if parts[1] == "msg":
+                text, markup = await message_page_view(0)
+            else:
+                text, markup = await memory_page_view(0)
+            await message.edit_text(text, reply_markup=markup)
+            await callback.answer()
+            return
+
+        if kind == "clr":
+            if parts[1] == "yes":
+                count = await asyncio.to_thread(storage.delete_all_memories)
+                agent.invalidate_memory_cache()
+                await message.edit_text(
+                    f"Воспоминания стёрты: {count}. Личность Мембу на месте."
+                )
+            else:
+                await message.edit_text("Отменено. Воспоминания на месте.")
+            await callback.answer()
+            return
+
+        if kind == "mem":
             action = parts[1]
 
             if action == "noop":
@@ -907,10 +1114,7 @@ async def handle_owner_callbacks(callback: CallbackQuery) -> None:
             elif action == "del":
                 memory_id = int(parts[2])
                 page = int(parts[3])
-                deleted_chat = await asyncio.to_thread(
-                    storage.delete_memory,
-                    memory_id,
-                )
+                deleted_chat = await asyncio.to_thread(storage.delete_memory, memory_id)
                 if deleted_chat is not None:
                     agent.invalidate_memory_cache(deleted_chat)
                 await callback.answer("Удалено из памяти")
@@ -922,19 +1126,82 @@ async def handle_owner_callbacks(callback: CallbackQuery) -> None:
             await message.edit_text(text, reply_markup=markup)
             if action == "page":
                 await callback.answer()
+            return
 
-        elif parts[0] == "clr":
-            if parts[1] == "yes":
-                count = await asyncio.to_thread(storage.delete_all_memories)
-                agent.invalidate_memory_cache()
-                await message.edit_text(
-                    f"Воспоминания стёрты: {count}. Личность Мембу на месте."
-                )
-            else:
-                await message.edit_text(
-                    "Отменено. Воспоминания на месте."
-                )
+        if kind == "msg":
+            action = parts[1]
+
+            if action == "noop":
+                await callback.answer()
+                return
+
+            if action == "page":
+                text, markup = await message_page_view(int(parts[2]))
+                await message.edit_text(text, reply_markup=markup)
+                await callback.answer()
+                return
+
+            if action == "view":
+                chat_id = int(parts[2])
+                message_id = int(parts[3])
+                page = int(parts[4])
+                view = await message_detail_view(chat_id, message_id, page)
+
+                if view is None:
+                    await callback.answer("Сообщение уже удалено")
+                    text, markup = await message_page_view(page)
+                    await message.edit_text(text, reply_markup=markup)
+                    return
+
+                text, markup = view
+                await message.edit_text(text, reply_markup=markup)
+                await callback.answer()
+                return
+
+            if action == "del":
+                chat_id = int(parts[2])
+                message_id = int(parts[3])
+                page = int(parts[4])
+                await asyncio.to_thread(storage.delete_message, chat_id, message_id)
+                await callback.answer("Сообщение удалено")
+                text, markup = await message_page_view(page)
+                await message.edit_text(text, reply_markup=markup)
+                return
+
             await callback.answer()
+            return
+
+        if kind == "ppl":
+            action = parts[1]
+
+            if action == "noop":
+                await callback.answer()
+                return
+
+            if action == "page":
+                text, markup = await people_page_view(int(parts[2]))
+                await message.edit_text(text, reply_markup=markup)
+                await callback.answer()
+                return
+
+            if action == "view":
+                chat_id = int(parts[2])
+                person_id = int(parts[3])
+                page = int(parts[4])
+                view = await person_detail_view(chat_id, person_id, page)
+
+                if view is None:
+                    await callback.answer("Мнение не найдено")
+                    text, markup = await people_page_view(page)
+                    await message.edit_text(text, reply_markup=markup)
+                    return
+
+                text, markup = view
+                await message.edit_text(text, reply_markup=markup)
+                await callback.answer()
+                return
+
+        await callback.answer()
 
     except TelegramAPIError as exc:
         # Например, «message is not modified», если страница не изменилась.
