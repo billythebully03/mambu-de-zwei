@@ -24,7 +24,7 @@ services:
         sync: false
 
       - key: MEMBU_DEBOUNCE_SECONDS
-        value: "2.4"
+        value: "3"
 
       - key: MEMBU_BRANCH_TTL_SECONDS
         value: "300"

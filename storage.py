@@ -16,7 +16,6 @@ class MembuStorage:
             event.get("ts", datetime.now().timestamp()),
             timezone.utc,
         ).isoformat()
-
         data = {
             "chat_id": event["chat_id"],
             "message_id": event["message_id"],
@@ -29,18 +28,13 @@ class MembuStorage:
             "branch_id": event.get("branch_id"),
             "created_at": created_at,
         }
-
         self.client.table("membu_messages").upsert(
             data,
             on_conflict="chat_id,message_id",
             ignore_duplicates=True,
         ).execute()
 
-    def recent_messages(
-        self,
-        chat_id: int,
-        limit: int = 18,
-    ) -> list[dict]:
+    def recent_messages(self, chat_id: int, limit: int = 18) -> list[dict]:
         result = (
             self.client.table("membu_messages")
             .select("*")
@@ -49,7 +43,6 @@ class MembuStorage:
             .limit(limit)
             .execute()
         )
-
         return list(reversed(result.data or []))
 
     def get_branch_for_message(
@@ -65,12 +58,9 @@ class MembuStorage:
             .limit(1)
             .execute()
         )
-
         rows = result.data or []
-
         if not rows:
             return None
-
         return rows[0].get("branch_id")
 
     def create_branch(
@@ -88,7 +78,6 @@ class MembuStorage:
             "active": True,
             "last_activity_at": self._utc_now(),
         }
-
         self.client.table("membu_branches").upsert(
             data,
             on_conflict="branch_id",
@@ -100,15 +89,9 @@ class MembuStorage:
         ttl_seconds: int = 300,
     ) -> list[dict]:
         cutoff = (
-            datetime.now(timezone.utc)
-            - timedelta(seconds=ttl_seconds)
+            datetime.now(timezone.utc) - timedelta(seconds=ttl_seconds)
         ).isoformat()
-
-        self.close_stale_branches(
-            chat_id,
-            ttl_seconds,
-        )
-
+        self.close_stale_branches(chat_id, ttl_seconds)
         result = (
             self.client.table("membu_branches")
             .select("*")
@@ -119,7 +102,6 @@ class MembuStorage:
             .limit(5)
             .execute()
         )
-
         return result.data or []
 
     def branch_messages(
@@ -137,26 +119,15 @@ class MembuStorage:
             .limit(limit)
             .execute()
         )
-
         return list(reversed(result.data or []))
 
-    def touch_branch(
-        self,
-        chat_id: int,
-        branch_id: str,
-    ):
+    def touch_branch(self, chat_id: int, branch_id: str):
         self.client.table("membu_branches").update(
             {
                 "last_activity_at": self._utc_now(),
                 "active": True,
             }
-        ).eq(
-            "chat_id",
-            chat_id,
-        ).eq(
-            "branch_id",
-            branch_id,
-        ).execute()
+        ).eq("chat_id", chat_id).eq("branch_id", branch_id).execute()
 
     def close_stale_branches(
         self,
@@ -164,41 +135,18 @@ class MembuStorage:
         ttl_seconds: int = 300,
     ):
         cutoff = (
-            datetime.now(timezone.utc)
-            - timedelta(seconds=ttl_seconds)
+            datetime.now(timezone.utc) - timedelta(seconds=ttl_seconds)
         ).isoformat()
-
         self.client.table("membu_branches").update(
             {"active": False}
-        ).eq(
-            "chat_id",
-            chat_id,
-        ).eq(
-            "active",
-            True,
-        ).lt(
-            "last_activity_at",
-            cutoff,
+        ).eq("chat_id", chat_id).eq("active", True).lt(
+            "last_activity_at", cutoff
         ).execute()
 
-    def set_branch_ai_time(
-        self,
-        chat_id: int,
-        branch_id: str,
-    ):
+    def set_branch_ai_time(self, chat_id: int, branch_id: str):
         self.client.table("membu_branches").update(
             {"last_ai_at": self._utc_now()}
-        ).eq(
-            "chat_id",
-            chat_id,
-        ).eq(
-            "branch_id",
-            branch_id,
-        ).execute()
-
-    # =========================================
-    # ДОЛГОВРЕМЕННАЯ ПАМЯТЬ
-    # =========================================
+        ).eq("chat_id", chat_id).eq("branch_id", branch_id).execute()
 
     def search_memories(
         self,
@@ -216,7 +164,6 @@ class MembuStorage:
                 "p_limit": max(1, min(limit, 8)),
             },
         ).execute()
-
         return result.data or []
 
     def save_memory(
@@ -235,20 +182,12 @@ class MembuStorage:
             "people": (people or [])[:10],
             "updated_at": self._utc_now(),
         }
-
         self.client.table("membu_memories").upsert(
             data,
             on_conflict="chat_id,category,content",
         ).execute()
 
-    # =========================================
-    # ПРОФИЛЬ СТИЛЯ ЧАТА
-    # =========================================
-
-    def get_chat_style(
-        self,
-        chat_id: int,
-    ) -> dict:
+    def get_chat_style(self, chat_id: int) -> dict:
         result = (
             self.client.table("membu_chat_profiles")
             .select(
@@ -259,9 +198,7 @@ class MembuStorage:
             .limit(1)
             .execute()
         )
-
         rows = result.data or []
-
         if not rows:
             return {
                 "chat_id": chat_id,
@@ -272,20 +209,9 @@ class MembuStorage:
             }
 
         profile = rows[0]
-
-        observed = int(
-            profile.get("observed_messages") or 0
-        )
-
-        analyzed = int(
-            profile.get("last_analyzed_message_count") or 0
-        )
-
-        profile["new_messages_since_analysis"] = max(
-            0,
-            observed - analyzed,
-        )
-
+        observed = int(profile.get("observed_messages") or 0)
+        analyzed = int(profile.get("last_analyzed_message_count") or 0)
+        profile["new_messages_since_analysis"] = max(0, observed - analyzed)
         return profile
 
     def update_chat_style(
@@ -295,23 +221,12 @@ class MembuStorage:
         minimum_new_messages: int = 15,
     ) -> dict:
         style_profile = str(style_profile or "").strip()
-
         if not style_profile:
-            return {
-                "updated": False,
-                "reason": "empty_profile",
-            }
+            return {"updated": False, "reason": "empty_profile"}
 
         current = self.get_chat_style(chat_id)
-
-        observed = int(
-            current.get("observed_messages") or 0
-        )
-
-        analyzed = int(
-            current.get("last_analyzed_message_count") or 0
-        )
-
+        observed = int(current.get("observed_messages") or 0)
+        analyzed = int(current.get("last_analyzed_message_count") or 0)
         new_messages = observed - analyzed
 
         if new_messages < minimum_new_messages:
@@ -328,7 +243,6 @@ class MembuStorage:
             "last_analyzed_message_count": observed,
             "updated_at": self._utc_now(),
         }
-
         self.client.table("membu_chat_profiles").upsert(
             data,
             on_conflict="chat_id",
@@ -340,278 +254,40 @@ class MembuStorage:
             "profile_length": len(style_profile[:2500]),
         }
 
-    # =========================================
-    # ПОИСК И РЕДАКТИРОВАНИЕ СООБЩЕНИЙ
-    # =========================================
+    def load_memories(self, chat_id: int, limit: int = 60) -> list[dict]:
+        """Самые важные воспоминания чата. Нужны для кэша в памяти процесса."""
+        result = (
+            self.client.table("membu_memories")
+            .select("id,category,content,importance,people,updated_at")
+            .eq("chat_id", chat_id)
+            .order("importance", desc=True)
+            .order("updated_at", desc=True)
+            .limit(max(1, min(limit, 200)))
+            .execute()
+        )
+        return result.data or []
 
     def search_own_messages(
         self,
         chat_id: int,
-        sender_id: int,
+        bot_id: int,
         query: str,
         limit: int = 5,
     ) -> list[dict]:
-        query = str(query or "").strip()[:120]
-
-        if len(query) < 2:
-            return []
-
+        """Буквальный поиск (подстрока без учёта регистра) по сообщениям самого Мембу."""
         escaped = (
             query.replace("\\", "\\\\")
             .replace("%", "\\%")
             .replace("_", "\\_")
         )
-
         result = (
             self.client.table("membu_messages")
-            .select(
-                "message_id,text,created_at,reply_to_message_id,branch_id"
-            )
+            .select("message_id,text,created_at")
             .eq("chat_id", chat_id)
-            .eq("sender_id", sender_id)
+            .eq("sender_id", bot_id)
             .ilike("text", f"%{escaped}%")
             .order("created_at", desc=True)
             .limit(max(1, min(limit, 8)))
             .execute()
         )
-
-        messages = result.data or []
-
-        for item in messages:
-            item["text"] = str(
-                item.get("text") or ""
-            )[:1500]
-
-        return messages
-
-    def get_own_message(
-        self,
-        chat_id: int,
-        message_id: int,
-        sender_id: int,
-    ) -> dict | None:
-        result = (
-            self.client.table("membu_messages")
-            .select(
-                "chat_id,message_id,sender_id,text,created_at,branch_id"
-            )
-            .eq("chat_id", chat_id)
-            .eq("message_id", message_id)
-            .eq("sender_id", sender_id)
-            .limit(1)
-            .execute()
-        )
-
-        rows = result.data or []
-
-        return rows[0] if rows else None
-
-    def has_message_been_edited(
-        self,
-        chat_id: int,
-        message_id: int,
-    ) -> bool:
-        result = (
-            self.client.table("membu_message_edits")
-            .select("id")
-            .eq("chat_id", chat_id)
-            .eq("message_id", message_id)
-            .limit(1)
-            .execute()
-        )
-
-        return bool(result.data)
-
-    def recent_message_edits(
-        self,
-        chat_id: int,
-        bot_user_id: int,
-        since_minutes: int = 60,
-        limit: int = 3,
-    ) -> list[dict]:
-        since_minutes = max(
-            1,
-            min(int(since_minutes), 60),
-        )
-
-        limit = max(
-            1,
-            min(int(limit), 3),
-        )
-
-        cutoff = (
-            datetime.now(timezone.utc)
-            - timedelta(minutes=since_minutes)
-        ).isoformat()
-
-        result = (
-            self.client.table("membu_message_edits")
-            .select("message_id,edited_at")
-            .eq("chat_id", chat_id)
-            .eq("bot_user_id", bot_user_id)
-            .gte("edited_at", cutoff)
-            .order("edited_at", desc=True)
-            .limit(limit)
-            .execute()
-        )
-
         return result.data or []
-
-    def record_message_edit(
-        self,
-        chat_id: int,
-        message_id: int,
-        bot_user_id: int,
-        old_text: str,
-        new_text: str,
-        reason: str,
-    ) -> dict:
-        result = self.client.rpc(
-            "record_membu_message_edit",
-            {
-                "p_chat_id": chat_id,
-                "p_message_id": message_id,
-                "p_bot_user_id": bot_user_id,
-                "p_old_text": old_text,
-                "p_new_text": new_text,
-                "p_reason": reason[:300],
-            },
-        ).execute()
-
-        data = result.data
-
-        if isinstance(data, dict):
-            return data
-
-        if isinstance(data, list) and data and isinstance(data[0], dict):
-            return data[0]
-
-        return {
-            "recorded": bool(data),
-            "reason": None if data else "empty_rpc_result",
-        }
-
-    # =========================================
-    # ЛИЧНЫЕ СООБЩЕНИЯ
-    # =========================================
-
-    def register_private_user(
-        self,
-        user_id: int,
-        private_chat_id: int,
-        first_name: str = "",
-        username: str = "",
-    ):
-        """Фиксирует добровольное начало личного диалога с ботом."""
-
-        data = {
-            "user_id": user_id,
-            "private_chat_id": private_chat_id,
-            "first_name": first_name[:150],
-            "username": username[:100],
-            "enabled": True,
-            "last_seen_at": self._utc_now(),
-        }
-
-        self.client.table("membu_private_users").upsert(
-            data,
-            on_conflict="user_id",
-        ).execute()
-
-    def set_private_user_enabled(
-        self,
-        user_id: int,
-        enabled: bool,
-    ):
-        self.client.table("membu_private_users").update(
-            {
-                "enabled": bool(enabled),
-                "last_seen_at": self._utc_now(),
-            }
-        ).eq(
-            "user_id",
-            user_id,
-        ).execute()
-
-    def has_private_chat_opt_in(
-        self,
-        user_id: int,
-    ) -> bool:
-        """Пользователь сам открыл личный чат и не заблокировал Мембу."""
-
-        result = (
-            self.client.table("membu_private_users")
-            .select("user_id")
-            .eq("user_id", user_id)
-            .eq("enabled", True)
-            .limit(1)
-            .execute()
-        )
-
-        return bool(result.data)
-
-    def set_chat_contact(
-        self,
-        chat_id: int,
-        user_id: int,
-        display_name: str = "",
-        username: str = "",
-    ):
-        data = {
-            "chat_id": chat_id,
-            "user_id": user_id,
-            "display_name": display_name[:200],
-            "username": username[:100],
-            "updated_at": self._utc_now(),
-        }
-
-        self.client.table("membu_chat_contacts").upsert(
-            data,
-            on_conflict="chat_id",
-        ).execute()
-
-    def remove_chat_contact(
-        self,
-        chat_id: int,
-    ):
-        self.client.table("membu_chat_contacts").delete().eq(
-            "chat_id",
-            chat_id,
-        ).execute()
-
-    def get_chat_contact(
-        self,
-        chat_id: int,
-    ) -> dict | None:
-        result = (
-            self.client.table("membu_chat_contacts")
-            .select("chat_id,user_id,display_name,username,last_notified_at")
-            .eq("chat_id", chat_id)
-            .limit(1)
-            .execute()
-        )
-
-        rows = result.data or []
-
-        return rows[0] if rows else None
-
-    def claim_chat_contact_notice(
-        self,
-        chat_id: int,
-    ) -> dict | None:
-        """Атомарно разрешает не более одного уведомления за 24 часа."""
-
-        result = self.client.rpc(
-            "claim_membu_removal_notice",
-            {"p_chat_id": chat_id},
-        ).execute()
-
-        data = result.data
-
-        if isinstance(data, dict):
-            return data
-
-        if isinstance(data, list) and data and isinstance(data[0], dict):
-            return data[0]
-
-        return None
