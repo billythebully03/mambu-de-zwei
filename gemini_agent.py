@@ -72,8 +72,10 @@ DIGEST_CHECK_INTERVAL_SECONDS = 60
 DIGEST_INSTRUCTION = (
     "Ты помогаешь Telegram-боту Мембу помнить чат. Из переписки выдели 2–5 "
     "долговечных фактов, которые стоит запомнить: о чём договорились, какие темы "
-    "обсуждали и чем закончили, предпочтения людей, внутренние шутки, устойчивые "
-    "мнения, незавершённые дела. Не пересказывай каждую реплику и не записывай "
+    "обсуждали и чем закончили, предпочтения людей, устойчивые мнения, незавершённые "
+    "дела. Шутки и повторяющиеся темы не сохраняй: это не факты, и память заставит "
+    "возвращаться к ним. Категорию inside_joke не используй. Важность темы не выше 3. "
+    "Не пересказывай каждую реплику и не записывай "
     "случайное. Не сохраняй пароли, документы, здоровье, личные секреты и "
     "чувствительные сведения. Верни ТОЛЬКО JSON-массив без пояснений. Каждый элемент: "
     "{\"category\": одна из profile, preference, relationship, ongoing, event, "
@@ -81,6 +83,48 @@ DIGEST_INSTRUCTION = (
     "\"importance\": число от 1 до 5; \"people\": массив имён}. Если важного нет, "
     "верни []."
 )
+
+
+def background_memories(
+    rows: list[dict],
+    limit: int = MEMORY_IN_CONTEXT,
+    per_category: int = 8,
+) -> list[dict]:
+    """Фон памяти для контекста: без внутренних шуток и без перекоса в одну категорию."""
+    counts: dict[str, int] = {}
+    out: list[dict] = []
+
+    for row in rows:
+        category = row.get("category") or ""
+
+        if category == "inside_joke":
+            continue
+        if counts.get(category, 0) >= per_category:
+            continue
+
+        counts[category] = counts.get(category, 0) + 1
+        out.append(row)
+
+        if len(out) >= limit:
+            break
+
+    return out
+
+
+def trim_own_messages(messages: list[dict], keep: int = 3) -> list[dict]:
+    """Оставляет в контексте только последние реплики самого Мембу, чтобы он не
+    продолжал свою прошлую шутку или тему по инерции."""
+    out: list[dict] = []
+    kept = 0
+
+    for m in reversed(messages):
+        if m.get("sender_name") == "Мембу":
+            if kept >= keep:
+                continue
+            kept += 1
+        out.append(m)
+
+    return list(reversed(out))
 
 
 def parse_digest_items(raw: str) -> list[dict]:
@@ -398,7 +442,10 @@ class GeminiAgent:
                         },
                         "importance": {
                             "type": "integer",
-                            "description": "Важность от 1 до 5.",
+                            "description": (
+                                "Важность от 1 до 5. Шутки и разовые темы — не выше 2. "
+                                "Важность 4–5 только для устойчивых фактов и предпочтений."
+                            ),
                         },
                         "people": {
                             "type": "array",
@@ -1221,10 +1268,10 @@ class GeminiAgent:
             "bot_status": bot_status or {},
             "recalled_history": recalled_history,
             "people_notes": people_notes,
-            "core_memories": core_memories[:MEMORY_IN_CONTEXT],
+            "core_memories": background_memories(core_memories),
             "recent_messages": [
                 {**m, "text": str(m.get("text", ""))[:300]}
-                for m in recent_messages
+                for m in trim_own_messages(recent_messages, keep=3)
             ],
             "current_branch_messages": branch_messages,
             "active_branches": active_branches,
@@ -1269,6 +1316,11 @@ class GeminiAgent:
             "Поиск по словам (search_chat_history) используй, только если точно знаешь, "
             "какое слово или тема нужны.\n\n"
 
+            "Не продолжай свою прошлую шутку или тему, если её никто не поднимал в последних "
+            "репликах. Отвечай на последнюю реплику по существу. Если человек спрашивает "
+            "серьёзно, отвечай серьёзно. Не своди разговор к одной теме и не возвращайся к "
+            "теме, которую уже исчерпали.\n\n"
+
             "Долговременная память чата уже в контексте, в поле core_memories. "
             "Это копия из базы, которую система держит в памяти и обновляет сама. "
             "Опирайся на неё без вызова инструментов. Вызывай search_memory только "
@@ -1279,7 +1331,8 @@ class GeminiAgent:
             "и не перед каждым ответом.\n\n"
 
             "Если узнал что-то важное и долговечное (предпочтение, факт о человеке, "
-            "внутреннюю шутку, устойчивое мнение), сохрани это через save_memory. "
+            "устойчивое мнение), сохрани это через save_memory. Шутки и разовые темы "
+            "не сохраняй. "
             "Не сохраняй каждую реплику, пароли, секреты и чувствительные данные.\n\n"
 
             "Поле chat_style — профиль манеры этого чата. Его регулярно пересобирает "
@@ -1295,7 +1348,7 @@ class GeminiAgent:
             "к незавершённой теме, задать осмысленный вопрос или поделиться "
             "наблюдением. Не заполняй тишину банальным «как дела?» и не выдумывай "
             "новости или личные события. Повод часто лежит в core_memories: незакрытая "
-            "тема, обещание, внутренняя шутка. Если нашёл такой повод, начинай разговор "
+            "тема или обещание. Если нашёл такой повод, начинай разговор "
             "охотнее. Если повода нет, промолчи.\n\n"
 
             "Память и темы: core_memories и внутренние шутки — это фон, а не темы для "
