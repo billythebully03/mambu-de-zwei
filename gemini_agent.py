@@ -1,6 +1,10 @@
 import asyncio
 import json
+from pathlib import Path
+from typing import Callable
 
+from aiogram.exceptions import TelegramAPIError
+from aiogram.types import ReactionTypeEmoji
 from google import genai
 from google.genai import types
 
@@ -15,6 +19,18 @@ MEMORY_CATEGORIES = [
     "opinion",
 ]
 
+# Эмодзи, которые Telegram Bot API принимает как стандартные реакции.
+TELEGRAM_REACTIONS = [
+    "❤", "👍", "👎", "🔥", "🥰", "👏", "😁", "🤔", "🤯", "😱",
+    "🤬", "😢", "🎉", "🤩", "🤮", "💩", "🙏", "👌", "🕊", "🤡",
+    "🥱", "🥴", "😍", "🐳", "❤‍🔥", "🌚", "🌭", "💯", "🤣", "⚡",
+    "🍌", "🏆", "💔", "🤨", "😐", "🍓", "🍾", "💋", "🖕", "😈",
+    "😴", "😭", "🤓", "👻", "👨‍💻", "👀", "🎃", "🙈", "😇", "😨",
+    "🤝", "✍", "🤗", "🫡", "🎅", "🎄", "☃", "💅", "🤪", "🗿",
+    "🆒", "💘", "🙉", "🦄", "😘", "💊", "🙊", "😎", "👾", "🤷‍♂",
+    "🤷", "🤷‍♀", "😡",
+]
+
 
 class GeminiAgent:
     def __init__(
@@ -24,28 +40,19 @@ class GeminiAgent:
         bot,
         bot_user,
         model: str = "gemini-3.5-flash-lite",
+        activity_callback: Callable[[int], None] | None = None,
     ):
-        self.client = genai.Client(
-            api_key=api_key
-        )
-
+        self.client = genai.Client(api_key=api_key)
         self.storage = storage
         self.bot = bot
         self.bot_user = bot_user
         self.model = model
+        self.activity_callback = activity_callback
 
-        from pathlib import Path
-
-        personality_path = (
-            Path(__file__).with_name("PERSONALITY.md")
-        )
-
-        self.personality = personality_path.read_text(
-            encoding="utf-8"
-        )
+        personality_path = Path(__file__).with_name("PERSONALITY.md")
+        self.personality = personality_path.read_text(encoding="utf-8")
 
         self.tools = self._build_tools()
-
         self.config = types.GenerateContentConfig(
             system_instruction=self.personality,
             tools=[self.tools],
@@ -54,52 +61,41 @@ class GeminiAgent:
         )
 
     def _build_tools(self):
-
         declarations = [
             types.FunctionDeclaration(
                 name="search_memory",
                 description=(
-                    "Ищет воспоминания Мембу о людях, "
-                    "событиях, отношениях, предпочтениях "
-                    "и прошлых разговорах. Используй только "
-                    "если старый контекст действительно нужен. "
-                    "Не вызывай автоматически перед каждым ответом."
+                    "Ищет воспоминания Мембу о людях, событиях, отношениях, "
+                    "предпочтениях и прошлых разговорах. Используй только если "
+                    "старый контекст действительно нужен. Не вызывай автоматически "
+                    "перед каждым ответом."
                 ),
                 parameters_json_schema={
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": (
-                                "Что именно нужно вспомнить."
-                            ),
+                            "description": "Что именно нужно вспомнить.",
                         },
                         "category": {
                             "type": "string",
                             "enum": MEMORY_CATEGORIES,
-                            "description": (
-                                "Категория воспоминания. "
-                                "Можно не указывать."
-                            ),
+                            "description": "Категория воспоминания. Можно не указывать.",
                         },
                         "limit": {
                             "type": "integer",
-                            "description": (
-                                "Количество результатов от 1 до 8."
-                            ),
+                            "description": "Количество результатов от 1 до 8.",
                         },
                     },
                     "required": ["query"],
                 },
             ),
-
             types.FunctionDeclaration(
                 name="save_memory",
                 description=(
-                    "Сохраняет долговременное воспоминание. "
-                    "Используй только для действительно важных "
-                    "или полезных в будущем сведений. "
-                    "Не сохраняй каждую реплику."
+                    "Сохраняет долговременное воспоминание. Используй только для "
+                    "действительно важных или полезных в будущем сведений. "
+                    "Не сохраняй каждую реплику, пароли, секреты или чувствительные данные."
                 ),
                 parameters_json_schema={
                     "type": "object",
@@ -110,64 +106,88 @@ class GeminiAgent:
                         },
                         "content": {
                             "type": "string",
-                            "description": (
-                                "Краткое и понятное воспоминание."
-                            ),
+                            "description": "Краткое и понятное воспоминание.",
                         },
                         "importance": {
                             "type": "integer",
-                            "description": (
-                                "Важность от 1 до 5."
-                            ),
+                            "description": "Важность от 1 до 5.",
                         },
                         "people": {
                             "type": "array",
-                            "items": {
-                                "type": "string",
-                            },
+                            "items": {"type": "string"},
                         },
                     },
-                    "required": [
-                        "category",
-                        "content",
-                        "importance",
-                    ],
+                    "required": ["category", "content", "importance"],
                 },
             ),
-
             types.FunctionDeclaration(
                 name="send_message",
                 description=(
-                    "Отправляет сообщение от имени Мембу "
-                    "в Telegram. Вызывай только если сам "
-                    "решил вступить в разговор. Если лучше "
-                    "промолчать, не вызывай этот инструмент."
+                    "Отправляет сообщение от имени Мембу в Telegram. Вызывай, "
+                    "только если сам решил написать. Если лучше промолчать, "
+                    "не вызывай этот инструмент. Можно указать сообщение, на которое "
+                    "нужно ответить. В обычной инициативе без конкретного адресата "
+                    "отправляй сообщение без reply."
                 ),
                 parameters_json_schema={
                     "type": "object",
                     "properties": {
                         "text": {
                             "type": "string",
-                            "description": (
-                                "Текст сообщения Мембу."
-                            ),
+                            "description": "Текст сообщения Мембу.",
                         },
                         "reply_to_message_id": {
                             "type": "integer",
-                            "description": (
-                                "Необязательный ID сообщения, "
-                                "на которое нужно ответить."
-                            ),
+                            "description": "Необязательный ID сообщения, на которое нужно ответить.",
                         },
                     },
                     "required": ["text"],
                 },
             ),
+            types.FunctionDeclaration(
+                name="send_reaction",
+                description=(
+                    "Ставит одну стандартную emoji-реакцию на существующее сообщение. "
+                    "Это полноценный способ ответить вместо текста. Используй, когда "
+                    "реакции достаточно, когда участник прямо просит о реакции или "
+                    "когда реакция естественно дополняет разговор. Не реагируй на всё "
+                    "подряд. message_id выбирай только из переданного контекста; "
+                    "не выдумывай идентификаторы. Предпочитай сообщения участников, "
+                    "а не собственные сообщения или сообщения других ботов, если "
+                    "тебя специально не попросили об обратном. Не пытайся реагировать "
+                    "на сервисные сообщения о входе/выходе участников: Telegram может "
+                    "запрещать это. Допустимые значения emoji: "
+                    + ", ".join(TELEGRAM_REACTIONS)
+                ),
+                parameters_json_schema={
+                    "type": "object",
+                    "properties": {
+                        "message_id": {
+                            "type": "integer",
+                            "description": "Точный ID сообщения из контекста чата.",
+                        },
+                        "emoji": {
+                            "type": "string",
+                            "enum": TELEGRAM_REACTIONS,
+                            "description": "Одна стандартная Telegram-реакция.",
+                        },
+                    },
+                    "required": ["message_id", "emoji"],
+                },
+            ),
         ]
 
-        return types.Tool(
-            function_declarations=declarations
-        )
+        return types.Tool(function_declarations=declarations)
+
+    def _mark_chat_activity(self, chat_id: int) -> None:
+        if self.activity_callback is None:
+            return
+        try:
+            self.activity_callback(chat_id)
+        except Exception:
+            # Отправленное сообщение уже не должно считаться неуспешным
+            # только из-за сбоя локального таймера активности.
+            pass
 
     async def _execute_tool(
         self,
@@ -175,29 +195,23 @@ class GeminiAgent:
         args: dict,
         chat_id: int,
         branch_id: str | None,
-    ):
-
+        is_stale: Callable[[], bool] | None = None,
+    ) -> dict:
         args = args or {}
 
         if name == "search_memory":
-
-            query = str(
-                args.get("query", "")
-            ).strip()
-
+            query = str(args.get("query", "")).strip()
             if not query:
-                return {
-                    "error": "Пустой поисковый запрос."
-                }
+                return {"error": "Пустой поисковый запрос."}
 
             category = args.get("category")
-
             if category not in MEMORY_CATEGORIES:
                 category = None
 
-            limit = int(
-                args.get("limit", 5)
-            )
+            try:
+                limit = int(args.get("limit", 5))
+            except (TypeError, ValueError):
+                limit = 5
 
             memories = await asyncio.to_thread(
                 self.storage.search_memories,
@@ -206,34 +220,23 @@ class GeminiAgent:
                 category,
                 max(1, min(limit, 8)),
             )
-
-            return {
-                "memories": memories,
-            }
+            return {"memories": memories}
 
         if name == "save_memory":
-
             category = args.get("category")
-            content = str(
-                args.get("content", "")
-            ).strip()
+            content = str(args.get("content", "")).strip()
 
             if category not in MEMORY_CATEGORIES:
-                return {
-                    "error": "Неизвестная категория."
-                }
-
+                return {"error": "Неизвестная категория."}
             if not content:
-                return {
-                    "error": "Пустое воспоминание."
-                }
+                return {"error": "Пустое воспоминание."}
 
-            importance = int(
-                args.get("importance", 3)
-            )
+            try:
+                importance = int(args.get("importance", 3))
+            except (TypeError, ValueError):
+                importance = 3
 
             people = args.get("people") or []
-
             if not isinstance(people, list):
                 people = []
 
@@ -245,34 +248,21 @@ class GeminiAgent:
                 importance,
                 people,
             )
-
-            return {
-                "saved": True,
-            }
+            return {"saved": True}
 
         if name == "send_message":
-
-            text = str(
-                args.get("text", "")
-            ).strip()
-
+            text = str(args.get("text", "")).strip()
             if not text:
-                return {
-                    "error": "Нельзя отправить пустое сообщение."
-                }
+                return {"error": "Нельзя отправить пустое сообщение."}
+
+            if is_stale and is_stale():
+                return {"cancelled": True, "reason": "В чате уже появилось новое сообщение."}
 
             text = text[:4000]
-
-            reply_to = args.get(
-                "reply_to_message_id"
-            )
+            reply_to = args.get("reply_to_message_id")
 
             try:
-                reply_to = (
-                    int(reply_to)
-                    if reply_to is not None
-                    else None
-                )
+                reply_to = int(reply_to) if reply_to is not None else None
             except (TypeError, ValueError):
                 reply_to = None
 
@@ -282,7 +272,6 @@ class GeminiAgent:
                 reply_to_message_id=reply_to,
             )
 
-            # Сохраняем и собственные сообщения Мембу.
             await asyncio.to_thread(
                 self.storage.add_message,
                 {
@@ -290,9 +279,7 @@ class GeminiAgent:
                     "message_id": sent.message_id,
                     "sender_id": self.bot_user.id,
                     "sender_name": "Мембу",
-                    "username": (
-                        self.bot_user.username or ""
-                    ),
+                    "username": self.bot_user.username or "",
                     "text": text,
                     "reply_to_user_id": None,
                     "reply_to_message_id": reply_to,
@@ -308,14 +295,44 @@ class GeminiAgent:
                     branch_id,
                 )
 
+            self._mark_chat_activity(chat_id)
+            return {"sent": True, "message_id": sent.message_id}
+
+        if name == "send_reaction":
+            try:
+                message_id = int(args.get("message_id"))
+            except (TypeError, ValueError):
+                return {"error": "Некорректный message_id."}
+
+            emoji = str(args.get("emoji", "")).strip()
+            if emoji not in TELEGRAM_REACTIONS:
+                return {"error": "Эта emoji-реакция не поддерживается Telegram Bot API."}
+
+            if is_stale and is_stale():
+                return {"cancelled": True, "reason": "В чате уже появилось новое сообщение."}
+
+            try:
+                await self.bot.set_message_reaction(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reaction=[ReactionTypeEmoji(emoji=emoji)],
+                )
+            except TelegramAPIError as exc:
+                return {
+                    "reacted": False,
+                    "message_id": message_id,
+                    "emoji": emoji,
+                    "error": str(exc)[:350],
+                }
+
+            self._mark_chat_activity(chat_id)
             return {
-                "sent": True,
-                "message_id": sent.message_id,
+                "reacted": True,
+                "message_id": message_id,
+                "emoji": emoji,
             }
 
-        return {
-            "error": "Неизвестный инструмент."
-        }
+        return {"error": "Неизвестный инструмент."}
 
     async def process(
         self,
@@ -326,8 +343,8 @@ class GeminiAgent:
         recent_messages: list[dict],
         branch_messages: list[dict],
         active_branches: list[dict],
-    ):
-
+        is_stale: Callable[[], bool] | None = None,
+    ) -> None:
         payload = {
             "chat_id": chat_id,
             "trigger": {
@@ -341,12 +358,31 @@ class GeminiAgent:
         }
 
         user_content = (
-            "Проанализируй текущую ситуацию в групповом чате. "
-            "Определи, обращаются ли к тебе, продолжается ли "
-            "разговор с твоим участием и есть ли естественный "
-            "повод вступить. Ты можешь промолчать. "
-            "Если решишь написать, обязательно вызови "
-            "send_message. Обычный текстовый ответ не отправляется.\n\n"
+            "Ты получил новую ситуацию из Telegram-чата. Сначала пойми, "
+            "что происходит и кто с кем разговаривает. Ты сам выбираешь, "
+            "нужно ли участвовать. Можешь промолчать. Не отвечай автоматически "
+            "на каждое сообщение.\n\n"
+            "Если хочешь написать текст, вызови send_message. Если достаточно "
+            "реакции или участник прямо просит её поставить, можешь вызвать "
+            "send_reaction. Обычно выбирай один способ взаимодействия; "
+            "используй оба только если каждый действительно добавляет что-то.\n\n"
+            "В recent_messages у сообщений есть точные message_id. Для реакции "
+            "используй только ID сообщения из контекста. Не угадывай ID. "
+            "Предпочитай сообщения участников, а не собственные сообщения "
+            "или сообщения других ботов. Не ставь реакцию на системные события "
+            "о входе/выходе участников.\n\n"
+            "Если trigger.reason равен long_silence_initiative, это не просьба "
+            "обязательно написать. Чат давно молчит: подумай, есть ли у тебя "
+            "естественный конкретный повод начать разговор — например, вернуться "
+            "к незавершённой теме, задать осмысленный вопрос или поделиться "
+            "наблюдением. Не заполняй тишину банальным «как дела?» и не выдумывай "
+            "новости или личные события. Если повода нет, промолчи.\n\n"
+            "Если trigger.reason связан с member_joined, member_left или "
+            "membership_changed, учти событие входа/выхода участника. Не обязан "
+            "приветствовать или комментировать каждого. Если реагировать неуместно, "
+            "промолчи.\n\n"
+            "Обычный текстовый ответ модели сам по себе не отправляется. "
+            "Для любого сообщения или реакции используй соответствующий инструмент.\n\n"
             "Контекст:\n"
             + json.dumps(
                 payload,
@@ -358,17 +394,16 @@ class GeminiAgent:
         contents = [
             types.Content(
                 role="user",
-                parts=[
-                    types.Part.from_text(
-                        text=user_content
-                    )
-                ],
+                parts=[types.Part.from_text(text=user_content)],
             )
         ]
 
-        # Ручной цикл Function Calling.
-        # Модель сама выбирает инструменты и порядок их вызова.
-        for _ in range(6):
+        # Ручной цикл Function Calling. Ответ инструмента отправляется назад
+        # в Gemini без поля id: google-genai Part.from_function_response()
+        # в установленной версии SDK не принимает такой аргумент.
+        for _ in range(8):
+            if is_stale and is_stale():
+                return
 
             response = await asyncio.to_thread(
                 self.client.models.generate_content,
@@ -378,51 +413,37 @@ class GeminiAgent:
             )
 
             calls = response.function_calls or []
-
-            # Если модель решила просто промолчать,
-            # никаких сообщений в Telegram не отправляем.
             if not calls:
+                # Модель решила промолчать либо ответила обычным текстом.
+                # В чат ничего не отправляем автоматически.
                 return
 
-            if (
-                response.candidates
-                and response.candidates[0].content
-            ):
-                contents.append(
-                    response.candidates[0].content
-                )
+            if response.candidates and response.candidates[0].content:
+                contents.append(response.candidates[0].content)
 
-            sent_message = False
+            performed_chat_action = False
 
             for call in calls:
+                if is_stale and is_stale():
+                    return
 
                 result = await self._execute_tool(
                     name=call.name,
                     args=call.args or {},
                     chat_id=chat_id,
                     branch_id=branch_id,
+                    is_stale=is_stale,
                 )
 
-                if (
-                    call.name == "send_message"
-                    and result.get("sent")
-                ):
-                    sent_message = True
+                if call.name == "send_message" and result.get("sent"):
+                    performed_chat_action = True
+                if call.name == "send_reaction" and result.get("reacted"):
+                    performed_chat_action = True
 
-                response_kwargs = {
-                    "name": call.name,
-                    "response": {
-                        "result": result,
-                    },
-                }
-
-                if getattr(call, "id", None):
-                    response_kwargs["id"] = call.id
-
-                function_response = (
-                    types.Part.from_function_response(
-                        **response_kwargs
-                    )
+                # Важно: не передаём call.id. Установленный SDK его не принимает.
+                function_response = types.Part.from_function_response(
+                    name=call.name,
+                    response={"result": result},
                 )
 
                 contents.append(
@@ -432,7 +453,7 @@ class GeminiAgent:
                     )
                 )
 
-            # После реальной отправки не нужно
-            # генерировать ещё одну реплику в этом цикле.
-            if sent_message:
+            # После публичного действия не просим модель тут же генерировать
+            # ещё одну реплику. Она уже поговорила или отреагировала.
+            if performed_chat_action:
                 return
