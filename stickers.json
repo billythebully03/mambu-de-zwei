@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "stickers": [
+    {
+      "key": "ragebyte_0_0",
+      "file_id": "CAACAgIAAxkBAAFXXIZq7tzXBZHmmNB4vCT_doWF-Z_KMgACO6UAAusbSEuv2PK_prdaBz0E",
+      "file_unique_id": "AgADO6UAAusbSEs",
+      "set_name": "smutas_by_TgEmodziBot",
+      "emoji": "🤩",
+      "format": "static",
+      "description": "Стикер с подписью «0/0 рейджбайт».",
+      "meaning": "Абсурдная, слегка перегруженная реакция; когда ситуация настолько странная, что нормальный комментарий уже не нужен.",
+      "usage": "Для неожиданного абсурда, странного результата или комичного недоумения. Не использовать как обычное приветствие."
+    },
+    {
+      "key": "ironic_agreement",
+      "file_id": "CAACAgIAAxkBAAFXXIhq7tz24Cl8ASiBinUmEOSoDXf4XAACz6UAAolemEi1cBmyXvNeGz0E",
+      "file_unique_id": "AgADz6UAAolemEg",
+      "set_name": "sticks_ef3d5_by_TgEmodziBot",
+      "emoji": "🤩",
+      "format": "static",
+      "description": "Комичное «устраивает».",
+      "meaning": "Ироничное согласие, принятие сомнительного или нелепого предложения.",
+      "usage": "Когда Мембу как будто соглашается, но сама ситуация или интонация делают согласие смешным."
+    },
+    {
+      "key": "total_indifference",
+      "file_id": "CAACAgIAAxkBAAFXXIpq7t0wHl36ngI6WIWisst83J_MMgACOWEAAmP6mUhVFpeDoU0nET0E",
+      "file_unique_id": "AgADOWEAAmP6mUg",
+      "set_name": "koshachiy_raskolbas",
+      "emoji": "🙄",
+      "format": "video",
+      "description": "Стикер «тотально похуй».",
+      "meaning": "Демонстративное безразличие, усталое принятие происходящего или отказ эмоционально вовлекаться.",
+      "usage": "Когда разговор не заслуживает серьёзной реакции или Мембу комично отстраняется. Не применять к реальным проблемам и переживаниям участников."
+    },
+    {
+      "key": "stop_messing_with_me",
+      "file_id": "CAACAgIAAxkBAAFXXIxq7t1Fh4vQ1kpLeb6LbkdYpqSi0wACZQcAAnwFBxvYdQhCK3d6AAE9BA",
+      "file_unique_id": "AgADZQcAAnwFBxs",
+      "set_name": "Dino_from_Odessa_eeZee",
+      "emoji": "😟",
+      "format": "static",
+      "description": "Стикер «не еби мне мозги».",
+      "meaning": "Раздражение, нетерпение, реакция на лишнюю путаницу или очевидную бессмыслицу.",
+      "usage": "Только в лёгкой перепалке или при комичном раздражении, когда отношения и контекст это позволяют. Не направлять на уязвимого участника."
+    },
+    {
+      "key": "fish_market",
+      "file_id": "CAACAgIAAxkBAAFXXI5q7t1WKiKHMa4TDhMmuQltP9NOXgACZAcAAnwFBxtDtbddx4jT7j0E",
+      "file_unique_id": "AgADZAcAAnwFBxs",
+      "set_name": "Dino_from_Odessa_eeZee",
+      "emoji": "☝️",
+      "format": "static",
+      "description": "«Пойдите на базар, купите рыбу и морочьте голову ей».",
+      "meaning": "Комичное отстранение от разговора; абсурдный способ сказать «оставьте меня в покое».",
+      "usage": "Для шутливого завершения надоевшей или бессмысленной перепалки. Не использовать в серьёзном конфликте."
+    },
+    {
+      "key": "sad_pug",
+      "file_id": "CAACAgIAAxkBAAFXXJBq7t1twvQnZj6GXDWJmKOH18EzdAACkJAAAtv5YEjyLhEVylA_ij0E",
+      "file_unique_id": "AgADkJAAAtv5YEg",
+      "set_name": "sbki2_by_TgEmodziBot",
+      "emoji": "🙂",
+      "format": "static",
+      "description": "Грустный мопс.",
+      "meaning": "Тихая грусть, неловкость, разочарование или мягкое сочувствие.",
+      "usage": "Когда короткая невербальная реакция уместнее текста. Не использовать для высмеивания чужой грусти."
+    }
+  ]
+}
