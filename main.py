@@ -132,6 +132,38 @@ chat_idle_tasks: dict[int, asyncio.Task] = {}
 chat_last_idle_attempt: dict[int, float] = {}
 
 
+GREETING_MORNING = re.compile(r"^\W*(доброе утро|доброго утра|утра|утро|good morning)(\W+\w{1,10})?\W*$", re.IGNORECASE)
+GREETING_NIGHT = re.compile(r"^\W*(спокойной ночи|сладких снов|доброй ночи|спокойной ночки)(\W+\w{1,10})?\W*$", re.IGNORECASE)
+_greeting_marks: set[tuple] = set()
+
+
+def greeting_moment(text: str, chat_id: int) -> bool:
+    """Утреннее (7–9) или ночное (21–23) пожелание по Дубаю. Один раз на чат в день
+    и окно: тогда Мембу решает, подключаться ли."""
+    body = (text or "").strip()
+    if not body or len(body) > 60:
+        return False
+
+    now = datetime.now(timezone(timedelta(hours=4)))
+
+    if 7 <= now.hour < 9:
+        window, pattern = "morning", GREETING_MORNING
+    elif 21 <= now.hour < 23:
+        window, pattern = "night", GREETING_NIGHT
+    else:
+        return False
+
+    if not pattern.search(body):
+        return False
+
+    key = (chat_id, now.date().isoformat(), window)
+    if key in _greeting_marks:
+        return False
+
+    _greeting_marks.add(key)
+    return True
+
+
 def is_mentioned(message: Message, current_bot: User) -> bool:
     text = message.text or message.caption or ""
 
@@ -1403,7 +1435,10 @@ async def handle_message(message: Message) -> None:
             )
         return
 
-    mentioned = is_mentioned(message, bot_user)
+    mentioned = is_mentioned(message, bot_user) or greeting_moment(
+        message.text or message.caption or "",
+        message.chat.id,
+    )
     replied_to_bot = is_reply_to_bot(message, bot_user)
     private_chat = message.chat.type == "private"
 

@@ -325,6 +325,7 @@ class GeminiAgent:
         self._active = 0
         self.switched_at: datetime | None = None
         self.last_failover_reason: str = ""
+        self._seen_switched_at: datetime | None = None
         self.storage = storage
         self.bot = bot
         self.bot_user = bot_user
@@ -544,7 +545,8 @@ class GeminiAgent:
                 name="send_message",
                 description=(
                     "Отправляет сообщение от имени Мембу в Telegram. Вызывай, "
-                    "только если сам решил написать. Если лучше промолчать, "
+                    "только если сам решил написать. За один ответ можно отправить до 15 "
+                    "сообщений, но только если это реально важно. Если лучше промолчать, "
                     "не вызывай этот инструмент. Можно указать сообщение, на которое "
                     "нужно ответить. Эмодзи можно естественно включить прямо в текст, "
                     "но это необязательно и не должно становиться привычкой в каждом сообщении."
@@ -1342,6 +1344,9 @@ class GeminiAgent:
         recalled_history = await self._recall_context(chat_id, recent_messages)
         people_notes = await self._people_notes_for(chat_id, recent_messages)
 
+        switched = self._consume_switch()
+        own_keep = 60 if switched else 3
+
         payload = {
             "chat_id": chat_id,
             "trigger": {
@@ -1355,10 +1360,11 @@ class GeminiAgent:
             "core_memories": background_memories(core_memories),
             "recent_messages": [
                 {**m, "text": str(m.get("text", ""))[:300]}
-                for m in trim_own_messages(recent_messages, keep=3)
+                for m in trim_own_messages(recent_messages, keep=own_keep)
             ],
             "current_branch_messages": branch_messages,
             "active_burst": active_burst(recent_messages, datetime.now(timezone.utc)),
+            "backup_key_switch": switched,
             "active_branches": active_branches,
             "chat_style": chat_style,
         }
@@ -1369,8 +1375,9 @@ class GeminiAgent:
             "нужно ли участвовать. Можешь промолчать. Не отвечай автоматически "
             "на каждое сообщение.\n\n"
 
-            "За один ответ можно отправить до 15 сообщений, но только если это реально важно, "
-            "например когда мысль нужно разбить на части. Обычно хватает одного. Каждое "
+            "За один ответ можно отправить до 15 сообщений. Дополнительные сообщения уместны, "
+            "когда есть что добавить, перевести тему или задать наводящий вопрос. Обычно хватает "
+            "одного-двух. Каждое "
             "следующее сообщение должно добавлять что-то новое. Ответом можно сослаться на любое "
             "сообщение (в том числе из истории или recalled_history, по message_id), на своё "
             "сообщение или не сослаться вовсе.\n\n"
@@ -1440,6 +1447,21 @@ class GeminiAgent:
             "репликах. Отвечай на последнюю реплику по существу. Если человек спрашивает "
             "серьёзно, отвечай серьёзно. Не своди разговор к одной теме и не возвращайся к "
             "теме, которую уже исчерпали.\n\n"
+
+            "Переключение ключа: если backup_key_switch = true, ты только что перешёл на "
+            "резервный ключ. Вспомни диалог по recent_messages (там последние 60 сообщений, "
+            "включая твои) и продолжай естественно, не удивляясь и ничего не объясняя без нужды.\n\n"
+
+            "Приветствия: если человека ещё нет в people_notes, поздоровайся тепло и по делу. "
+            "Сарказм по желанию, а не обязательно. Банальное «ну как ты?» после приветствия — "
+            "живее, но тоже не обязательно.\n\n"
+
+            "Утра и ночи: если кто-то желает доброго утра или спокойной ночи, можешь коротко "
+            "подключиться в тон. Сам первым в тишине не пиши.\n\n"
+
+            "Инициатива в потоке: в активном диалоге можешь перевести тему, задать наводящий "
+            "вопрос или высказать свою точку зрения. Это тоже инициатива. Пустое «привет» "
+            "раз в полчаса инициативой не считается.\n\n"
 
             "Знакомство: если человек незнаком (нет в people_notes и ты не видел его "
             "сообщений в этом чате), можешь познакомиться коротко. Если тебя спрашивают, "
@@ -1616,7 +1638,7 @@ class GeminiAgent:
                     )
                 )
 
-            # Больше двух публичных действий за один ответ не отправляем.
+            # Не больше MAX_CHAT_ACTIONS_PER_TURN публичных действий за один ответ.
             if chat_actions >= MAX_CHAT_ACTIONS_PER_TURN:
                 return
 
@@ -1721,6 +1743,13 @@ class GeminiAgent:
 
         finally:
             self._digest_running.discard(chat_id)
+
+    def _consume_switch(self) -> bool:
+        """True один раз после переключения на резервный ключ, чтобы Мембу вспомнил диалог."""
+        if self.switched_at and self.switched_at != self._seen_switched_at:
+            self._seen_switched_at = self.switched_at
+            return True
+        return False
 
     @property
     def using_backup(self) -> bool:
