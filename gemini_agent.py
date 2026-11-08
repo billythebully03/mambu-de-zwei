@@ -45,8 +45,10 @@ STYLE_CHECK_INTERVAL_SECONDS = 60
 # Сколько последних сообщений (людей и Мембу) отдаём аналитику стиля.
 STYLE_SAMPLE_SIZE = 100
 MAX_CHAT_ACTIONS_PER_TURN = 15
-MUTE_COOLDOWN_SECONDS = 1800
-REMOVE_COOLDOWN_SECONDS = 7 * 86400
+MUTE_COOLDOWN_SECONDS = 5 * 60
+WEB_SEARCH_COOLDOWN_SECONDS = 120
+DICE_EMOJIS = ["🎲", "🎯", "🏀", "⚽", "🎳", "🎰"]
+REMOVE_COOLDOWN_SECONDS = 3 * 60
 PRIMARY_RETRY_SECONDS = 1800
 
 
@@ -384,6 +386,7 @@ class GeminiAgent:
         self._digest_running: set[int] = set()
         self._mute_at: dict[tuple[int, int], float] = {}
         self._remove_at: dict[int, float] = {}
+        self._search_at: dict[int, float] = {}
 
         base_dir = Path(__file__).resolve().parent
 
@@ -595,6 +598,66 @@ class GeminiAgent:
             ),
 
             types.FunctionDeclaration(
+                name="send_poll",
+                description=(
+                    "Создаёт опрос в чате с вариантами ответа. Используй редко: по случаю или когда "
+                    "попросили. Вопрос до 300 символов, от 2 до 10 вариантов, каждый до 100 символов. "
+                    "Опрос не анонимный, чтобы видеть итоги."
+                ),
+                parameters_json_schema={
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string"},
+                        "options": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["question", "options"],
+                },
+            ),
+
+            types.FunctionDeclaration(
+                name="close_poll",
+                description=(
+                    "Закрывает опрос, созданный тобой, и возвращает итоги по вариантам. "
+                    "message_id опроса возьми из ответа send_poll."
+                ),
+                parameters_json_schema={
+                    "type": "object",
+                    "properties": {"message_id": {"type": "integer"}},
+                    "required": ["message_id"],
+                },
+            ),
+
+            types.FunctionDeclaration(
+                name="send_dice",
+                description=(
+                    "Отправляет игровую анимацию Telegram: 🎲 кубик, 🎯 дартс, 🏀 баскетбол, "
+                    "⚽ футбол, 🎳 боулинг, 🎰 слоты. Результат придёт сразу в ответе инструмента: "
+                    "value. Используй, когда уместно или когда попросили. Прокомментируй результат."
+                ),
+                parameters_json_schema={
+                    "type": "object",
+                    "properties": {
+                        "emoji": {"type": "string", "enum": DICE_EMOJIS},
+                    },
+                    "required": ["emoji"],
+                },
+            ),
+
+            types.FunctionDeclaration(
+                name="web_search",
+                description=(
+                    "Ищет актуальные факты в интернете и возвращает краткий ответ. Используй, когда "
+                    "нужен свежий факт или ты точно не знаешь ответа. Не для болтовни и не для "
+                    "того, что и так знаешь. Не чаще одного раза за пару минут в чате."
+                ),
+                parameters_json_schema={
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            ),
+
+            types.FunctionDeclaration(
                 name="restrict_member",
                 description=(
                     "Временно ограничивает участника: он не сможет писать в чат, пока срок не выйдет. "
@@ -632,7 +695,7 @@ class GeminiAgent:
                 name="remove_member",
                 description=(
                     "Удаляет участника из чата. Крайне редко, только за серьёзный повод. "
-                    "В одном чате не чаще раза в неделю. Не применяй к админам. "
+                    "В одном чате не чаще раза в 3 минуты. Не применяй к админам. "
                     "Обязательно укажи причину."
                 ),
                 parameters_json_schema={
@@ -1249,6 +1312,104 @@ class GeminiAgent:
                 "emoji": emoji,
             }
 
+        if name == "send_poll":
+            question = str(args.get("question", "")).strip()[:300]
+            options = [str(o).strip()[:100] for o in (args.get("options") or []) if str(o).strip()]
+            if not question or not 2 <= len(options) <= 10:
+                return {"sent": False, "error": "Нужен вопрос и от 2 до 10 вариантов."}
+
+            if is_stale and is_stale():
+                return {"cancelled": True, "reason": "В чате уже появилось новое сообщение."}
+
+            try:
+                sent = await self.bot.send_poll(
+                    chat_id=chat_id,
+                    question=question,
+                    options=options,
+                    is_anonymous=False,
+                )
+            except TelegramAPIError as exc:
+                return {"sent": False, "error": str(exc)[:300]}
+
+            await self._store_bot_message(
+                chat_id, sent,
+                f"[опрос] {question} | " + " / ".join(options),
+                branch_id, None,
+            )
+            self._mark_chat_activity(chat_id)
+            return {"sent": True, "message_id": sent.message_id}
+
+        if name == "close_poll":
+            try:
+                message_id = int(args.get("message_id"))
+            except (TypeError, ValueError):
+                return {"done": False, "error": "Некорректный message_id."}
+            try:
+                poll = await self.bot.stop_poll(chat_id=chat_id, message_id=message_id)
+            except TelegramAPIError as exc:
+                return {"done": False, "error": str(exc)[:300]}
+            return {
+                "done": True,
+                "question": poll.question,
+                "results": [
+                    {"option": o.text, "votes": o.voter_count} for o in poll.options
+                ],
+            }
+
+        if name == "send_dice":
+            emoji = str(args.get("emoji", "")).strip()
+            if emoji not in DICE_EMOJIS:
+                return {"sent": False, "error": "Эта игра не поддерживается."}
+
+            if is_stale and is_stale():
+                return {"cancelled": True, "reason": "В чате уже появилось новое сообщение."}
+
+            try:
+                sent = await self.bot.send_dice(chat_id=chat_id, emoji=emoji)
+            except TelegramAPIError as exc:
+                return {"sent": False, "error": str(exc)[:300]}
+
+            value = sent.dice.value if sent.dice else None
+            await self._store_bot_message(
+                chat_id, sent, f"[игра {emoji}: {value}]", branch_id, None,
+            )
+            self._mark_chat_activity(chat_id)
+            return {"sent": True, "emoji": emoji, "value": value}
+
+        if name == "web_search":
+            query = str(args.get("query", "")).strip()[:300]
+            if not query:
+                return {"error": "Пустой запрос."}
+
+            now = time.time()
+            last = self._search_at.get(chat_id, 0.0)
+            if now - last < WEB_SEARCH_COOLDOWN_SECONDS:
+                return {"error": "Поиск недавно был, ответь по тому, что уже есть."}
+            self._search_at[chat_id] = now
+
+            try:
+                response = await asyncio.to_thread(
+                    self._generate,
+                    model=self.model,
+                    contents=query,
+                    config=types.GenerateContentConfig(
+                        system_instruction=(
+                            "Ответь по-русски кратко и по делу, опираясь на результаты поиска. "
+                            "Если точного ответа нет, так и скажи."
+                        ),
+                        tools=[types.Tool(google_search=types.GoogleSearch())],
+                        temperature=0.2,
+                        max_output_tokens=500,
+                    ),
+                )
+            except Exception as exc:
+                self.note_api_error(exc)
+                logging.exception("Ошибка веб-поиска")
+                return {"error": "Поиск сейчас недоступен."}
+
+            answer = (response.text or "").strip()
+            return {"answer": answer[:1200]} if answer else {"error": "Ничего не нашёл."}
+
         if name in {"restrict_member", "unrestrict_member", "remove_member"}:
             return await self._moderate(name, args, chat_id, is_stale)
 
@@ -1262,7 +1423,7 @@ class GeminiAgent:
         is_stale: Callable[[], bool] | None,
     ) -> dict:
         """Мут, снятие мута и удаление участника. Охраны: админов и бота не трогаем,
-        мут не чаще раза в 30 минут на человека, удаление не чаще раза в неделю в чате."""
+        мут не чаще раза в 5 минут на человека, удаление не чаще раза в 3 минуты в чате."""
         if os.getenv("MEMBU_MODERATION", "1") != "1":
             return {"done": False, "error": "Модерация выключена."}
 
@@ -1295,7 +1456,7 @@ class GeminiAgent:
             if name == "restrict_member":
                 last = self._mute_at.get((chat_id, target), 0.0)
                 if now - last < MUTE_COOLDOWN_SECONDS:
-                    return {"done": False, "error": "Этого участника недавно ограничивали."}
+                    return {"done": False, "error": "Этого участника недавно ограничивали, подожди 5 минут."}
                 minutes = max(1, min(int(args.get("minutes") or 10), 1440))
                 await self.bot.restrict_chat_member(
                     chat_id=chat_id,
@@ -1333,7 +1494,7 @@ class GeminiAgent:
                     return {"done": False, "error": "Нужна причина."}
                 last = self._remove_at.get(chat_id, 0.0)
                 if now - last < REMOVE_COOLDOWN_SECONDS:
-                    return {"done": False, "error": "Удалять участников в этом чате можно не чаще раза в неделю."}
+                    return {"done": False, "error": "Удалять участников в этом чате можно не чаще раза в 3 минуты."}
                 await self.bot.ban_chat_member(chat_id=chat_id, user_id=target)
                 await self.bot.unban_chat_member(chat_id=chat_id, user_id=target, only_if_banned=True)
                 self._remove_at[chat_id] = now
@@ -1722,6 +1883,11 @@ class GeminiAgent:
             "Сними ограничение раньше, если шутка удалась. Удаление только за серьёзный повод "
             "и очень редко. Не трогай админов и себя. Не мути за критику тебя или резкий тон.\n\n"
 
+            "Игры и поиск: send_poll — редко, по случаю или когда попросили. send_dice — кубик, "
+            "дартс, мяч и т.п., когда уместно; результат придёт в ответе инструмента, прокомментируй его. "
+            "web_search — когда нужен свежий факт, которого ты точно не знаешь; не для болтовни. "
+            "Решаешь сам, нужны ли инструменты.\n\n"
+
             "Поток мыслей: если в payload есть active_burst, человек, скорее всего, пишет "
             "несколькими сообщениями подряд. Не отвечай на первую часть. Если мысль явно не "
             "закончена (обрывается, «и», «а», «короче», многоточие), промолчи и дождись "
@@ -1947,7 +2113,7 @@ class GeminiAgent:
                     is_stale=is_stale,
                 )
 
-                if call.name in {"send_message", "send_sticker", "send_reaction", "send_voice"}:
+                if call.name in {"send_message", "send_sticker", "send_reaction", "send_voice", "send_poll", "send_dice"}:
                     if result.get("sent") or result.get("reacted"):
                         chat_actions += 1
                         await asyncio.sleep(CHAT_ACTION_PAUSE_SECONDS)
