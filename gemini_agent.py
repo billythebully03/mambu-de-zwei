@@ -36,7 +36,7 @@ TELEGRAM_REACTIONS = [
     "🤷", "🤷‍♀", "😡",
 ]
 
-MIN_MESSAGES_FOR_STYLE_UPDATE = 10
+MIN_MESSAGES_FOR_STYLE_UPDATE = 60
 
 # Аналитик стиля смотрит на переписку не чаще, чем раз в эти секунды.
 STYLE_CHECK_INTERVAL_SECONDS = 60
@@ -88,7 +88,7 @@ STYLE_ANALYST_INSTRUCTION = (
 
 # Дайджест: раз в столько новых сообщений модель выделяет из переписки
 # долговременные факты и записывает их в память чата.
-DIGEST_EVERY_MESSAGES = 80
+DIGEST_EVERY_MESSAGES = 150
 DIGEST_SAMPLE_SIZE = 120
 DIGEST_CHECK_INTERVAL_SECONDS = 60
 
@@ -267,7 +267,7 @@ RECALL_STOPWORDS = {
 
 
 # Мнения о людях: раз в полчаса смотрим на самых активных участников.
-PEOPLE_CHECK_INTERVAL_SECONDS = 1800
+PEOPLE_CHECK_INTERVAL_SECONDS = 7200
 PEOPLE_WINDOW = 150
 PEOPLE_MAX_PER_RUN = 4
 PEOPLE_MIN_MESSAGES = 5
@@ -318,11 +318,22 @@ class GeminiAgent:
     ):
         # Основной ключ и резервный (GEMINI_BACKUP_API_KEY). Переключаемся на резерв,
         # когда основной отваливается по квоте или ключу; основной пробуем снова позже.
-        self._clients = [genai.Client(api_key=api_key)]
-        backup_key = os.getenv("GEMINI_BACKUP_API_KEY", "").strip()
-        if backup_key and backup_key != (api_key or ""):
-            self._clients.append(genai.Client(api_key=backup_key))
+        keys = [("основной", api_key or "")]
+        for label, env_name in (
+            ("резервный", "GEMINI_BACKUP_API_KEY"),
+            ("резервный 2", "GEMINI_BACKUP2_API_KEY"),
+        ):
+            value = os.getenv(env_name, "").strip()
+            if value and value not in {k for _, k in keys}:
+                keys.append((label, value))
+        self._labels = [label for label, _ in keys]
+        self._clients = [genai.Client(api_key=value) for _, value in keys]
         self._active = 0
+        self._manual = False
+        # Кэш системного промпта по ключам: (имя кэша, время создания). Если Gemini
+        # не принимает кэш, на этом ключе он отключается ненадолго.
+        self._caches: dict[int, tuple[str, float]] = {}
+        self._cache_off_until: dict[int, float] = {}
         self.switched_at: datetime | None = None
         self.last_failover_reason: str = ""
         self._seen_switched_at: datetime | None = None
@@ -1345,7 +1356,7 @@ class GeminiAgent:
         people_notes = await self._people_notes_for(chat_id, recent_messages)
 
         switched = self._consume_switch()
-        own_keep = 60 if switched else 3
+        own_keep = 45 if switched else 3
 
         payload = {
             "chat_id": chat_id,
@@ -1388,8 +1399,15 @@ class GeminiAgent:
             "Вайб: короткая живая реплика часто лучше развёрнутой. Не разворачивай без повода: "
             "рассуждай, когда спросили мнение или тема этого требует.\n\n"
 
+            "Чужие вопросы: если реплика адресована не тебе, не отвечай на неё без явного повода. "
+            "Не комментируй чужие вопросы просто потому, что можешь. Чаще молчи.\n\n"
+
+            "Непонимание: если не понимаешь, о чём речь, не выдумывай. Посмотри историю и память "
+            "(search_chat_history, search_memory, browse_chat_history) и отвечай по найденному.\n\n"
+
             "Живой разговор: если разговор идёт и у тебя есть мнение, дополнение или "
-            "несогласие, выскажи его, даже без вопроса в конце. Молчи, когда тебе действительно "
+            "несогласие, выскажи его, даже без вопроса в конце, но не вмешивайся в вопросы, "
+            "адресованные другим. Молчи, когда тебе действительно "
             "нечего добавить, а не потому что неудобно влезать. Это не обязанность. "
             "Инициатива — конкретный ход, а не филлер «ну». Выводы делай только из сказанного.\n\n"
 
@@ -1456,7 +1474,11 @@ class GeminiAgent:
             "живее, но тоже не обязательно.\n\n"
 
             "Утра и ночи: если кто-то желает доброго утра или сладких снов (в том числе уходящему), "
-            "реши сам, уместно ли подключиться. Сам первым в тишине не пиши.\n\n"
+            "реши сам, уместно ли подключиться. В тишине сам не начинай, кроме утра и вечера.\n\n"
+
+            "Утро и вечер: если trigger.reason начинается с daily_window, это утро или вечер "
+            "по Дубаю. Можешь сам коротко пожелать доброго утра или сладких снов, если захочешь. "
+            "Не обязан, и один раз на окно достаточно.\n\n"
 
             "Не влезай, если люди явно говорят между собой в этой ветке, даже если до этого "
             "говорили с тобой. Лучше промолчать, чем вклиниться не к месту.\n\n"
@@ -1566,7 +1588,7 @@ class GeminiAgent:
         nudged = False
         chat_actions = 0
 
-        for _ in range(20):
+        for _ in range(8):
             if is_stale and is_stale():
                 return
 
@@ -1759,7 +1781,40 @@ class GeminiAgent:
 
     @property
     def using_backup(self) -> bool:
-        return self._active == 1
+        return self._active != 0
+
+    def _cache_for(self, index: int) -> str | None:
+        """Имя кэша системного промпта для ключа. None — кэш недоступен."""
+        now = time.monotonic()
+
+        if self._cache_off_until.get(index, 0.0) > now:
+            return None
+
+        entry = self._caches.get(index)
+        if entry and now - entry[1] < 3000:
+            return entry[0]
+
+        try:
+            cache = self._clients[index].caches.create(
+                model=self.model,
+                config=types.CreateCachedContentConfig(
+                    system_instruction=self.personality,
+                    ttl="3600s",
+                ),
+            )
+            name = cache.name
+        except Exception as exc:
+            logging.info("MEMBU_CACHE | кэш недоступен на ключе %s: %s", index, exc)
+            self._cache_off_until[index] = now + 3600
+            self._caches.pop(index, None)
+            return None
+
+        if not name:
+            self._cache_off_until[index] = now + 3600
+            return None
+
+        self._caches[index] = (name, now)
+        return name
 
     def _generate(self, **kwargs):
         """Вызов модели с переключением на резервный ключ при квоте или ошибке ключа.
@@ -1767,7 +1822,8 @@ class GeminiAgent:
         now = datetime.now(timezone.utc)
 
         if (
-            self._active == 1
+            self._active != 0
+            and not self._manual
             and self.switched_at
             and (now - self.switched_at).total_seconds() > PRIMARY_RETRY_SECONDS
         ):
@@ -1778,12 +1834,34 @@ class GeminiAgent:
 
         for index in order:
             try:
-                response = self._clients[index].models.generate_content(**kwargs)
+                cache_name = (
+                    self._cache_for(index) if kwargs.get("config") is self.config else None
+                )
+                if cache_name:
+                    cached_config = types.GenerateContentConfig(
+                        tools=[self.tools],
+                        temperature=0.9,
+                        max_output_tokens=900,
+                        cached_content=cache_name,
+                    )
+                    try:
+                        response = self._clients[index].models.generate_content(
+                            **{**kwargs, "config": cached_config}
+                        )
+                    except Exception as cache_exc:
+                        if _should_failover(cache_exc):
+                            raise
+                        logging.warning("MEMBU_CACHE | запрос без кэша: %s", cache_exc)
+                        self._cache_off_until[index] = time.monotonic() + 3600
+                        response = self._clients[index].models.generate_content(**kwargs)
+                else:
+                    response = self._clients[index].models.generate_content(**kwargs)
             except Exception as exc:
                 last_exc = exc
                 if not _should_failover(exc) or index == order[-1]:
                     raise
                 self._active = (index + 1) % len(self._clients)
+                self._manual = False
                 self.switched_at = datetime.now(timezone.utc)
                 self.last_failover_reason = str(exc)[:200]
                 logging.warning("MEMBU_KEY | переключение на резервный ключ: %s", exc)
@@ -1795,6 +1873,47 @@ class GeminiAgent:
             return response
 
         raise last_exc or RuntimeError("Нет доступных ключей Gemini")
+
+    @property
+    def active_key_index(self) -> int:
+        return self._active
+
+    @property
+    def key_labels(self) -> list[str]:
+        return list(self._labels)
+
+    def set_active_key(self, index: int) -> None:
+        """Ручное переключение: этот ключ остаётся активным, пока не упрётся в лимит."""
+        self._active = index % len(self._clients)
+        self._manual = True
+        self.switched_at = datetime.now(timezone.utc)
+        self.last_failover_reason = "ручное переключение"
+
+    async def probe_keys(self) -> list[dict]:
+        """Проверяет каждый ключ крошечным запросом: есть лимит или нет."""
+
+        def probe(client) -> dict:
+            try:
+                client.models.generate_content(
+                    model=self.model,
+                    contents="ok",
+                    config={"max_output_tokens": 1},
+                )
+                return {"ok": True, "reset_at": None, "error": ""}
+            except Exception as exc:
+                text = str(exc)
+                lowered = text.lower()
+                if "resource_exhausted" in lowered or "429" in text or "quota" in lowered:
+                    reset_at = quota_reset_time(text, datetime.now(timezone.utc))
+                    return {"ok": False, "reset_at": reset_at, "error": "лимит"}
+                return {"ok": False, "reset_at": None, "error": text[:120]}
+
+        results = []
+        for index, client in enumerate(self._clients):
+            info = await asyncio.to_thread(probe, client)
+            info["label"] = self._labels[index]
+            results.append(info)
+        return results
 
     def note_api_error(self, exc: Exception) -> None:
         """Запоминает последнюю ошибку API и лимит, чтобы показать в /status."""

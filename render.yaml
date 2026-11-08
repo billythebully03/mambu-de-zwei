@@ -18,6 +18,9 @@ services:
       - key: GEMINI_BACKUP_API_KEY
         sync: false
 
+      - key: GEMINI_BACKUP2_API_KEY
+        sync: false
+
       - key: GEMINI_MODEL
         value: gemini-3.5-flash-lite
 

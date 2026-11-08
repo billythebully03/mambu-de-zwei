@@ -52,7 +52,7 @@ MAX_CHAT_QUEUE = int(os.getenv("MEMBU_MAX_CHAT_QUEUE", "30"))
 
 # Сколько последних сообщений чата видит модель в каждом контексте.
 # Без этого «вспомни, что обсуждали» работает только если модель сама вызовет поиск.
-RECENT_MESSAGES_FOR_CONTEXT = int(os.getenv("MEMBU_RECENT_MESSAGES", "60"))
+RECENT_MESSAGES_FOR_CONTEXT = int(os.getenv("MEMBU_RECENT_MESSAGES", "45"))
 
 BRANCH_TTL = int(
     os.getenv("MEMBU_BRANCH_TTL_SECONDS", "300")
@@ -222,11 +222,7 @@ def mark_chat_activity(chat_id: int, *, human_activity: bool = True) -> None:
     if event is not None:
         event.set()
 
-    task = chat_idle_tasks.get(chat_id)
-    if task is None or task.done():
-        chat_idle_tasks[chat_id] = asyncio.create_task(
-            idle_initiative_monitor(chat_id)
-        )
+    # Инициатива в тишине отключена: Мембу сам пишет только утром и вечером (daily_window_monitor).
 
 
 def register_group_activity(chat_id: int) -> None:
@@ -923,6 +919,47 @@ async def clearall_command(message: Message) -> None:
     )
 
 
+async def key_view() -> tuple[str, InlineKeyboardMarkup]:
+    results = await agent.probe_keys()
+    active = agent.active_key_index
+    lines = ["Ключи Gemini"]
+    keyboard = []
+
+    for index, info in enumerate(results):
+        if info["ok"]:
+            mark = "🟢 без лимита"
+        elif info["error"] == "лимит":
+            if info["reset_at"]:
+                mark = f"🔴 лимит, обновится {format_dubai(info['reset_at'])} (Дубай)"
+            else:
+                mark = "🔴 лимит"
+        else:
+            mark = f"🔴 ошибка: {info['error']}"
+
+        flag = " · активный" if index == active else ""
+        lines.append(f"{info['label']}: {mark}{flag}")
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"Переключить на {info['label']}",
+                callback_data=f"key:use:{index}",
+            )
+        ])
+
+    keyboard.append([InlineKeyboardButton(text="Проверить снова", callback_data="key:check")])
+    lines.append("")
+    lines.append("При лимите ключи переключаются сами. Ручное переключение держится, пока не упрётся в лимит.")
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+@router.message(Command("key"))
+async def key_command(message: Message) -> None:
+    if not is_owner_dm(message.from_user, message.chat.type) or agent is None:
+        return
+
+    text, markup = await key_view()
+    await message.answer(text, reply_markup=markup)
+
+
 async def style_list_view() -> tuple[str, InlineKeyboardMarkup]:
     rows = await asyncio.to_thread(storage.list_style_profiles, 20)
 
@@ -1189,7 +1226,7 @@ async def people_command(message: Message) -> None:
 
 
 @router.callback_query(
-    F.data.startswith(("mem:", "msg:", "ppl:", "tab:", "clr:", "rst:", "sty:"))
+    F.data.startswith(("mem:", "msg:", "ppl:", "tab:", "clr:", "rst:", "sty:", "key:"))
 )
 async def handle_owner_callbacks(callback: CallbackQuery) -> None:
     message = callback.message
@@ -1210,6 +1247,19 @@ async def handle_owner_callbacks(callback: CallbackQuery) -> None:
                 text, markup = await memory_page_view(0)
             await message.edit_text(text, reply_markup=markup)
             await callback.answer()
+            return
+
+        if kind == "key":
+            action = parts[1]
+
+            if action == "use":
+                agent.set_active_key(int(parts[2]))
+                await callback.answer("Переключено")
+
+            text, markup = await key_view()
+            await message.edit_text(text, reply_markup=markup)
+            if action != "use":
+                await callback.answer()
             return
 
         if kind == "sty":
@@ -1545,6 +1595,52 @@ async def handle_message(message: Message) -> None:
     )
 
 
+_daily_marks: set[tuple] = set()
+daily_tasks: set[asyncio.Task] = set()
+
+
+async def daily_window_monitor() -> None:
+    """Раз в окно (утро 7–9, вечер 21–23 по Дубаю) и на чат даёт модели шанс
+    сам пожелать доброго утра или сладких снов. Решает модель."""
+    await asyncio.sleep(60)
+
+    while True:
+        try:
+            now = datetime.now(timezone(timedelta(hours=4)))
+
+            if 7 <= now.hour < 9:
+                window = "morning"
+            elif 21 <= now.hour < 23:
+                window = "evening"
+            else:
+                window = None
+
+            if window and agent is not None and storage is not None:
+                for chat_id in list(group_chat_ids):
+                    key = (chat_id, now.date().isoformat(), window)
+                    if key in _daily_marks:
+                        continue
+
+                    _daily_marks.add(key)
+                    fut = enqueue_chat_job(
+                        chat_id,
+                        partial(
+                            run_agent_with_context,
+                            chat_id=chat_id,
+                            branch_id=None,
+                            reason=f"daily_window_{window}",
+                            direct=False,
+                        ),
+                    )
+                    fut.add_done_callback(
+                        lambda f: f.cancelled() or f.exception()
+                    )
+        except Exception:
+            logging.exception("Ошибка монитора утра и вечера")
+
+        await asyncio.sleep(300)
+
+
 async def main() -> None:
     global bot_user, storage, agent, bot
 
@@ -1568,6 +1664,10 @@ async def main() -> None:
         )
 
     bot = Bot(token=TOKEN)
+
+    daily_task = asyncio.create_task(daily_window_monitor())
+    daily_tasks.add(daily_task)
+    daily_task.add_done_callback(daily_tasks.discard)
 
     try:
         bot_user = await bot.get_me()
