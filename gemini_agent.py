@@ -70,6 +70,14 @@ MEMORY_LOAD_LIMIT = 60
 MEMORY_IN_CONTEXT = 40
 STYLE_CACHE_TTL_SECONDS = 300
 
+STYLE_EDIT_INSTRUCTION = (
+    "Ты редактор профиля манеры общения чата. Тебе дают текущий профиль и правку владельца. "
+    "Примени правку и верни ТОЛЬКО обновлённый профиль в том же формате, без пояснений. "
+    "Правка владельца важнее прежних пунктов. Если правка — число, оставь ровно столько "
+    "самых важных пунктов профиля. Если правка — текст, внеси её по смыслу. "
+    "Ничего не добавляй от себя сверх правки."
+)
+
 STYLE_ANALYST_INSTRUCTION = (
     "Ты ведёшь профиль манеры общения Мембу в этом чате. Твоя задача — описать, как "
     "в этом чате принято писать, чтобы Мембу постепенно говорил так же, как участники. "
@@ -1246,6 +1254,51 @@ class GeminiAgent:
         self._background.add(task)
         task.add_done_callback(self._background.discard)
 
+    async def apply_style_edit(self, chat_id: int, instruction: str) -> bool:
+        """Правит профиль стиля по ответу владельца на сообщение с профилем."""
+        current = await asyncio.to_thread(self.storage.get_chat_style, chat_id)
+        profile = (current.get("style_profile") or "").strip()
+        if not profile:
+            return False
+
+        prompt = (
+            "Текущий профиль:\n" + profile
+            + "\n\nПравка владельца:\n" + instruction
+        )
+
+        try:
+            response = await asyncio.to_thread(
+                self._generate,
+                model=self.model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=STYLE_EDIT_INSTRUCTION,
+                    temperature=0.2,
+                    max_output_tokens=1200,
+                ),
+            )
+        except Exception as exc:
+            self.note_api_error(exc)
+            logging.exception("Не удалось применить правку стиля чата %s", chat_id)
+            return False
+
+        new_profile = (response.text or "").strip()
+        if not new_profile:
+            return False
+
+        result = await asyncio.to_thread(
+            self.storage.update_chat_style,
+            chat_id,
+            new_profile,
+            -1000000,
+        )
+        if not result.get("updated"):
+            return False
+
+        self._style_cache.pop(chat_id, None)
+        logging.info("MEMBU_STYLE | chat=%s | profile edited by owner", chat_id)
+        return True
+
     async def force_style_refresh(self, chat_id: int) -> None:
         """Обновляет профиль стиля сейчас, не дожидаясь порога по сообщениям."""
         await self.refresh_chat_style(chat_id, force=True)
@@ -1495,8 +1548,20 @@ class GeminiAgent:
 
             "Сложный набор сообщений: если сразу пишут много людей или сообщения сложные, "
             "не обязан отвечать на каждое только ради ответа. Можно промолчать, подождать "
-            "и ответить через пару сообщений, но предметнее. Можно и отвечать на каждое. "
-            "Решай сам.\n\n"
+            "и ответить через пару сообщений, но предметнее.\n\n"
+
+            "Чужие сообщения: если реплика не адресована тебе, даже если в ней говорят о тебе, "
+            "а от тебя ничего не требуется, лучше промолчать или поставить реакцию. Комментируй, "
+            "только если сказанное требует ответа или у тебя есть что добавить по делу.\n\n"
+
+            "Поддержка диалога: если разговор живой и идёт с тобой, иногда мягко поддерживай его: "
+            "задай вопрос по сути или выскажи мнение как прямое продолжение мысли собеседника, "
+            "а не новую тему. Второе сообщение подряд — редко, только чтобы дописать важное.\n\n"
+
+            "Юмор: шутки, иронии и подколы — часть твоей личности, но не в каждой реплике. "
+            "Не делай из каждой фразы шутку или подкол. Будь добрым и классным участником. "
+            "Юмор уместен, когда он вырастает из контекста, как «дайте мне соску и премию» "
+            "в ответ на «говори как младенец».\n\n"
 
             "Поток мыслей: если в payload есть active_burst, человек, скорее всего, пишет "
             "несколькими сообщениями подряд. Не отвечай на первую часть. Если мысль явно не "

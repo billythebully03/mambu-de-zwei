@@ -1274,6 +1274,7 @@ async def handle_owner_callbacks(callback: CallbackQuery) -> None:
             if action == "view":
                 text, markup = await style_chat_view(int(parts[2]))
                 await message.edit_text(text, reply_markup=markup)
+                STYLE_VIEW_MESSAGES[message.message_id] = int(parts[2])
                 await callback.answer()
                 return
 
@@ -1283,6 +1284,7 @@ async def handle_owner_callbacks(callback: CallbackQuery) -> None:
                 await agent.force_style_refresh(chat_id)
                 text, markup = await style_chat_view(chat_id)
                 await message.edit_text(text, reply_markup=markup)
+                STYLE_VIEW_MESSAGES[message.message_id] = chat_id
                 return
 
             await callback.answer()
@@ -1451,6 +1453,38 @@ async def handle_owner_callbacks(callback: CallbackQuery) -> None:
         logging.debug("Кнопка управления памятью: %s", exc)
     except (ValueError, IndexError):
         await callback.answer("Не понял кнопку.")
+
+
+STYLE_VIEW_MESSAGES: dict[int, int] = {}
+
+
+def _is_style_reply(message: Message) -> bool:
+    return (
+        is_owner_dm(message.from_user, message.chat.type)
+        and message.reply_to_message is not None
+        and message.reply_to_message.message_id in STYLE_VIEW_MESSAGES
+    )
+
+
+@router.message(F.text, _is_style_reply)
+async def style_edit_reply(message: Message) -> None:
+    if agent is None:
+        return
+
+    chat_id = STYLE_VIEW_MESSAGES[message.reply_to_message.message_id]
+    instruction = message.text.strip()
+    if not instruction:
+        return
+
+    status = await message.answer("Правлю профиль…")
+    ok = await agent.apply_style_edit(chat_id, instruction)
+    if not ok:
+        await status.edit_text("Не получилось поправить профиль. Попробуй ещё раз.")
+        return
+
+    text, markup = await style_chat_view(chat_id)
+    await status.edit_text(text, reply_markup=markup)
+    STYLE_VIEW_MESSAGES[status.message_id] = chat_id
 
 
 @router.message()
