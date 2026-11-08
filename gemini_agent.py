@@ -10,9 +10,11 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import ReactionTypeEmoji
+from aiogram.types import BufferedInputFile, ReactionTypeEmoji
 from google import genai
 from google.genai import types
+
+import fish_voice
 
 
 MEMORY_CATEGORIES = [
@@ -59,6 +61,7 @@ def _should_failover(exc: Exception) -> bool:
         for marker in ("resource_exhausted", "quota", "api key", "permission denied", "429")
     )
 CHAT_ACTION_PAUSE_SECONDS = 1.0
+VOICE_MIN_INTERVAL_SECONDS = 7200
 
 # Кэш памяти из Supabase: как долго держим его без перезагрузки.
 MEMORY_CACHE_TTL_SECONDS = 300
@@ -334,6 +337,7 @@ class GeminiAgent:
         # не принимает кэш, на этом ключе он отключается ненадолго.
         self._caches: dict[int, tuple[str, float]] = {}
         self._cache_off_until: dict[int, float] = {}
+        self._voice_last_at: dict[int, float] = {}
         self.switched_at: datetime | None = None
         self.last_failover_reason: str = ""
         self._seen_switched_at: datetime | None = None
@@ -700,6 +704,32 @@ class GeminiAgent:
             ),
         ]
 
+        if fish_voice.voice_enabled():
+            declarations.append(
+                types.FunctionDeclaration(
+                    name="send_voice",
+                    description=(
+                        "Отправляет голосовое сообщение Мембу. Используй очень редко: только когда "
+                        "это реально круто и уместно, или когда участник прямо попросил голосовое. "
+                        "Коротко, до 240 символов. Обычно хватает текста."
+                    ),
+                    parameters_json_schema={
+                        "type": "object",
+                        "properties": {
+                            "text": {
+                                "type": "string",
+                                "description": "Что произнести, коротко.",
+                            },
+                            "reply_to_message_id": {
+                                "type": "integer",
+                                "description": "Необязательный ID сообщения, на которое ответить голосовым.",
+                            },
+                        },
+                        "required": ["text"],
+                    },
+                )
+            )
+
         if self.stickers:
             sticker_keys = list(self.stickers.keys())
 
@@ -1065,6 +1095,54 @@ class GeminiAgent:
                 "message_id": sent.message_id,
             }
 
+        if name == "send_voice":
+            if not fish_voice.voice_enabled():
+                return {"sent": False, "error": "Голос не настроен."}
+
+            text = str(args.get("text", "")).strip()
+            if not text:
+                return {"sent": False, "error": "Пустой текст."}
+
+            last = self._voice_last_at.get(chat_id, 0.0)
+            if time.monotonic() - last < VOICE_MIN_INTERVAL_SECONDS:
+                return {
+                    "sent": False,
+                    "error": "Голосовое было недавно. Отправь текстом.",
+                }
+
+            if is_stale and is_stale():
+                return {
+                    "cancelled": True,
+                    "reason": "В чате уже появилось новое сообщение.",
+                }
+
+            audio = await fish_voice.synthesize(text)
+            if not audio:
+                return {"sent": False, "error": "Синтез голоса недоступен."}
+
+            reply_to = self._parse_reply_to(args)
+
+            try:
+                sent = await self.bot.send_voice(
+                    chat_id=chat_id,
+                    voice=BufferedInputFile(audio, filename="membu.mp3"),
+                    reply_to_message_id=reply_to,
+                )
+            except TelegramAPIError as exc:
+                return {"sent": False, "error": str(exc)[:350]}
+
+            self._voice_last_at[chat_id] = time.monotonic()
+
+            await self._store_bot_message(
+                chat_id,
+                sent,
+                f"[голосовое] {text}"[:3000],
+                branch_id,
+                reply_to,
+            )
+
+            return {"sent": True, "message_id": sent.message_id}
+
         if name == "send_reaction":
             try:
                 message_id = int(args.get("message_id"))
@@ -1399,6 +1477,9 @@ class GeminiAgent:
             "Вайб: короткая живая реплика часто лучше развёрнутой. Не разворачивай без повода: "
             "рассуждай, когда спросили мнение или тема этого требует.\n\n"
 
+            "Голосовые: send_voice доступен, но используй очень редко — только когда это круто "
+            "и уместно или когда участник прямо попросил голосовое. Коротко. Обычно хватает текста.\n\n"
+
             "Чужие вопросы: если реплика адресована не тебе, не отвечай на неё без явного повода. "
             "Не комментируй чужие вопросы просто потому, что можешь. Чаще молчи.\n\n"
 
@@ -1649,7 +1730,7 @@ class GeminiAgent:
                     is_stale=is_stale,
                 )
 
-                if call.name in {"send_message", "send_sticker", "send_reaction"}:
+                if call.name in {"send_message", "send_sticker", "send_reaction", "send_voice"}:
                     if result.get("sent") or result.get("reacted"):
                         chat_actions += 1
                         await asyncio.sleep(CHAT_ACTION_PAUSE_SECONDS)

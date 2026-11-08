@@ -21,6 +21,12 @@ services:
       - key: GEMINI_BACKUP2_API_KEY
         sync: false
 
+      - key: FISH_API_KEY
+        sync: false
+
+      - key: FISH_VOICE_ID
+        sync: false
+
       - key: GEMINI_MODEL
         value: gemini-3.5-flash-lite
 
