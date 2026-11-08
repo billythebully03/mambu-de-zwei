@@ -45,10 +45,8 @@ STYLE_CHECK_INTERVAL_SECONDS = 60
 # Сколько последних сообщений (людей и Мембу) отдаём аналитику стиля.
 STYLE_SAMPLE_SIZE = 100
 MAX_CHAT_ACTIONS_PER_TURN = 15
-MUTE_COOLDOWN_SECONDS = 5 * 60
 WEB_SEARCH_COOLDOWN_SECONDS = 120
 DICE_EMOJIS = ["🎲", "🎯", "🏀", "⚽", "🎳", "🎰"]
-REMOVE_COOLDOWN_SECONDS = 3 * 60
 PRIMARY_RETRY_SECONDS = 1800
 
 
@@ -384,8 +382,6 @@ class GeminiAgent:
         # Дайджест памяти: аналогичные проверка и защита от параллельного запуска.
         self._digest_checked_at: dict[int, float] = {}
         self._digest_running: set[int] = set()
-        self._mute_at: dict[tuple[int, int], float] = {}
-        self._remove_at: dict[int, float] = {}
         self._search_at: dict[int, float] = {}
 
         base_dir = Path(__file__).resolve().parent
@@ -695,7 +691,7 @@ class GeminiAgent:
                 name="remove_member",
                 description=(
                     "Удаляет участника из чата. Крайне редко, только за серьёзный повод. "
-                    "В одном чате не чаще раза в 3 минуты. Не применяй к админам. "
+                    "Не применяй к админам. "
                     "Обязательно укажи причину."
                 ),
                 parameters_json_schema={
@@ -1423,7 +1419,7 @@ class GeminiAgent:
         is_stale: Callable[[], bool] | None,
     ) -> dict:
         """Мут, снятие мута и удаление участника. Охраны: админов и бота не трогаем,
-        мут не чаще раза в 5 минут на человека, удаление не чаще раза в 3 минуты в чате."""
+        без кулдаунов; админы и сам бот защищены."""
         if os.getenv("MEMBU_MODERATION", "1") != "1":
             return {"done": False, "error": "Модерация выключена."}
 
@@ -1454,9 +1450,6 @@ class GeminiAgent:
         now = time.time()
         try:
             if name == "restrict_member":
-                last = self._mute_at.get((chat_id, target), 0.0)
-                if now - last < MUTE_COOLDOWN_SECONDS:
-                    return {"done": False, "error": "Этого участника недавно ограничивали, подожди 5 минут."}
                 minutes = max(1, min(int(args.get("minutes") or 10), 1440))
                 await self.bot.restrict_chat_member(
                     chat_id=chat_id,
@@ -1464,7 +1457,6 @@ class GeminiAgent:
                     permissions=ChatPermissions(can_send_messages=False),
                     until_date=datetime.now(timezone.utc) + timedelta(minutes=minutes),
                 )
-                self._mute_at[(chat_id, target)] = now
                 logging.info("MEMBU_MOD | restricted user=%s chat=%s min=%s reason=%s", target, chat_id, minutes, reason)
                 result = {"done": True, "action": "restricted", "minutes": minutes}
 
@@ -1485,19 +1477,14 @@ class GeminiAgent:
                         can_add_web_page_previews=True,
                     ),
                 )
-                self._mute_at.pop((chat_id, target), None)
                 logging.info("MEMBU_MOD | unrestricted user=%s chat=%s", target, chat_id)
                 result = {"done": True, "action": "unrestricted"}
 
             else:
                 if not reason:
                     return {"done": False, "error": "Нужна причина."}
-                last = self._remove_at.get(chat_id, 0.0)
-                if now - last < REMOVE_COOLDOWN_SECONDS:
-                    return {"done": False, "error": "Удалять участников в этом чате можно не чаще раза в 3 минуты."}
                 await self.bot.ban_chat_member(chat_id=chat_id, user_id=target)
                 await self.bot.unban_chat_member(chat_id=chat_id, user_id=target, only_if_banned=True)
-                self._remove_at[chat_id] = now
                 logging.warning("MEMBU_MOD | removed user=%s chat=%s reason=%s", target, chat_id, reason)
                 result = {"done": True, "action": "removed"}
 
