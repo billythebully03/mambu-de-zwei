@@ -21,6 +21,9 @@ services:
       - key: GEMINI_BACKUP2_API_KEY
         sync: false
 
+      - key: GEMINI_BACKUP3_API_KEY
+        sync: false
+
       - key: FISH_API_KEY
         sync: false
 

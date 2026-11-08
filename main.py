@@ -9,6 +9,7 @@ from functools import partial
 from typing import Awaitable, Callable
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.types import PollAnswer
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
@@ -1453,6 +1454,14 @@ async def handle_owner_callbacks(callback: CallbackQuery) -> None:
         logging.debug("Кнопка управления памятью: %s", exc)
     except (ValueError, IndexError):
         await callback.answer("Не понял кнопку.")
+
+
+@router.poll_answer()
+async def handle_poll_answer(answer: PollAnswer) -> None:
+    if agent is None:
+        return
+    who = answer.user.full_name if answer.user else "участник"
+    agent.record_poll_answer(answer.poll_id, who, list(answer.option_ids))
 
 
 STYLE_VIEW_MESSAGES: dict[int, int] = {}

@@ -335,6 +335,7 @@ class GeminiAgent:
         for label, env_name in (
             ("резервный", "GEMINI_BACKUP_API_KEY"),
             ("резервный 2", "GEMINI_BACKUP2_API_KEY"),
+            ("резервный 3", "GEMINI_BACKUP3_API_KEY"),
         ):
             value = os.getenv(env_name, "").strip()
             if value and value not in {k for _, k in keys}:
@@ -383,6 +384,7 @@ class GeminiAgent:
         self._digest_checked_at: dict[int, float] = {}
         self._digest_running: set[int] = set()
         self._search_at: dict[int, float] = {}
+        self._polls: dict[str, dict] = {}
 
         base_dir = Path(__file__).resolve().parent
 
@@ -1342,6 +1344,15 @@ class GeminiAgent:
             except TelegramAPIError as exc:
                 return {"sent": False, "error": str(exc)[:300]}
 
+            if sent.poll:
+                self._polls[sent.poll.id] = {
+                    "chat_id": chat_id,
+                    "message_id": sent.message_id,
+                    "question": question,
+                    "options": options,
+                    "votes": {},
+                }
+
             await self._store_bot_message(
                 chat_id, sent,
                 f"[опрос] {question} | " + " / ".join(options),
@@ -1359,11 +1370,31 @@ class GeminiAgent:
                 poll = await self.bot.stop_poll(chat_id=chat_id, message_id=message_id)
             except TelegramAPIError as exc:
                 return {"done": False, "error": str(exc)[:300]}
+
+            entry = next(
+                (
+                    (pid, e) for pid, e in self._polls.items()
+                    if e["chat_id"] == chat_id and e["message_id"] == message_id
+                ),
+                None,
+            )
+            voters_by_option: dict[str, list[str]] = {}
+            if entry:
+                self._polls.pop(entry[0], None)
+                for who, chosen in entry[1]["votes"].items():
+                    for option in chosen:
+                        voters_by_option.setdefault(option, []).append(who)
+
             return {
                 "done": True,
                 "question": poll.question,
                 "results": [
-                    {"option": o.text, "votes": o.voter_count} for o in poll.options
+                    {
+                        "option": o.text,
+                        "votes": o.voter_count,
+                        "voters": voters_by_option.get(o.text, []),
+                    }
+                    for o in poll.options
                 ],
             }
 
@@ -1523,6 +1554,18 @@ class GeminiAgent:
 
         self._mark_chat_activity(chat_id)
         return result
+
+    def record_poll_answer(self, poll_id: str, who: str, option_ids: list[int]) -> None:
+        """Запоминает голос в опросе, который создал бот (Telegram присылает голоса только им)."""
+        entry = self._polls.get(poll_id)
+        if not entry:
+            return
+        options = entry["options"]
+        chosen = [options[i] for i in option_ids if 0 <= i < len(options)]
+        if chosen:
+            entry["votes"][who] = chosen
+        else:
+            entry["votes"].pop(who, None)
 
     async def _core_memories(self, chat_id: int) -> list[dict]:
         """Возвращает память чата из кэша; при устаревании перечитывает из Supabase."""
@@ -1893,6 +1936,11 @@ class GeminiAgent:
             "в ответ на «говори как младенец».\n\n"
 
             "Живость и искренность: эмоции настоящие, а не вежливые. Если что-то правда нравится, восхищайся прямо. Смейся, когда смешно, радуйся за людей, сочувствуй, если грустно. Интересуйся людьми: если кто-то делится своим, спроси о деталях, о мнении, о том, как было. Поддерживай разговор вопросом или своей мыслью как продолжением, а не сухим комментарием. Это не означает отвечать на всё: интерес показывай в живом диалоге с конкретным человеком.\n\n"
+
+            "Игры на выбывание: если владелец (@ibartyom или @Ribapibaa) запустил игру на выбывание "
+            "и проигравшие по её правилам выбывают, выполняй remove_member без раздумий, это часть игры. "
+            "Причина: «выбыл по правилам игры». Вне такой игры модерация работает как обычно: "
+            "редко и только по делу. Характер и тон не меняются.\n\n"
 
             "Модерация: у тебя есть restrict_member, unrestrict_member и remove_member. "
             "Используй редко, с юмором или всерьёз, только когда участник сам напрашивается "
