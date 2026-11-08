@@ -10,7 +10,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import BufferedInputFile, ReactionTypeEmoji
+from aiogram.types import BufferedInputFile, ChatPermissions, ReactionTypeEmoji
 from google import genai
 from google.genai import types
 
@@ -45,6 +45,8 @@ STYLE_CHECK_INTERVAL_SECONDS = 60
 # Сколько последних сообщений (людей и Мембу) отдаём аналитику стиля.
 STYLE_SAMPLE_SIZE = 100
 MAX_CHAT_ACTIONS_PER_TURN = 15
+MUTE_COOLDOWN_SECONDS = 1800
+REMOVE_COOLDOWN_SECONDS = 7 * 86400
 PRIMARY_RETRY_SECONDS = 1800
 
 
@@ -380,6 +382,8 @@ class GeminiAgent:
         # Дайджест памяти: аналогичные проверка и защита от параллельного запуска.
         self._digest_checked_at: dict[int, float] = {}
         self._digest_running: set[int] = set()
+        self._mute_at: dict[tuple[int, int], float] = {}
+        self._remove_at: dict[int, float] = {}
 
         base_dir = Path(__file__).resolve().parent
 
@@ -587,6 +591,57 @@ class GeminiAgent:
                         },
                     },
                     "required": ["text"],
+                },
+            ),
+
+            types.FunctionDeclaration(
+                name="restrict_member",
+                description=(
+                    "Временно ограничивает участника: он не сможет писать в чат, пока срок не выйдет. "
+                    "Можно для шутки или всерьёз, но только когда участник сам напрашивается "
+                    "(например, флудит или хамит). Срок от 1 до 1440 минут, обычно 5–30. "
+                    "Не применяй к админам. Обязательно укажи причину."
+                ),
+                parameters_json_schema={
+                    "type": "object",
+                    "properties": {
+                        "user_id": {"type": "integer", "description": "ID участника из people_notes или контекста."},
+                        "minutes": {"type": "integer", "description": "Срок ограничения, 1–1440."},
+                        "reason": {"type": "string", "description": "Короткая причина."},
+                    },
+                    "required": ["user_id", "minutes", "reason"],
+                },
+            ),
+
+            types.FunctionDeclaration(
+                name="unrestrict_member",
+                description=(
+                    "Снимает ограничение с участника раньше срока, например если шутка удалась "
+                    "и хватит."
+                ),
+                parameters_json_schema={
+                    "type": "object",
+                    "properties": {
+                        "user_id": {"type": "integer", "description": "ID участника."},
+                    },
+                    "required": ["user_id"],
+                },
+            ),
+
+            types.FunctionDeclaration(
+                name="remove_member",
+                description=(
+                    "Удаляет участника из чата. Крайне редко, только за серьёзный повод. "
+                    "В одном чате не чаще раза в неделю. Не применяй к админам. "
+                    "Обязательно укажи причину."
+                ),
+                parameters_json_schema={
+                    "type": "object",
+                    "properties": {
+                        "user_id": {"type": "integer", "description": "ID участника."},
+                        "reason": {"type": "string", "description": "Серьёзная причина."},
+                    },
+                    "required": ["user_id", "reason"],
                 },
             ),
 
@@ -1194,7 +1249,102 @@ class GeminiAgent:
                 "emoji": emoji,
             }
 
+        if name in {"restrict_member", "unrestrict_member", "remove_member"}:
+            return await self._moderate(name, args, chat_id, is_stale)
+
         return {"error": "Неизвестный инструмент."}
+
+    async def _moderate(
+        self,
+        name: str,
+        args: dict,
+        chat_id: int,
+        is_stale: Callable[[], bool] | None,
+    ) -> dict:
+        """Мут, снятие мута и удаление участника. Охраны: админов и бота не трогаем,
+        мут не чаще раза в 30 минут на человека, удаление не чаще раза в неделю в чате."""
+        if os.getenv("MEMBU_MODERATION", "1") != "1":
+            return {"done": False, "error": "Модерация выключена."}
+
+        try:
+            target = int(args.get("user_id"))
+        except (TypeError, ValueError):
+            return {"done": False, "error": "Некорректный user_id."}
+
+        reason = str(args.get("reason", "")).strip()[:200]
+
+        if is_stale and is_stale():
+            return {"cancelled": True, "reason": "В чате уже появилось новое сообщение."}
+
+        try:
+            admins = await self.bot.get_chat_administrators(chat_id)
+            me = await self.bot.get_me()
+        except TelegramAPIError as exc:
+            return {"done": False, "error": str(exc)[:300]}
+
+        admin_ids = {a.user.id for a in admins}
+        if target == me.id or target in admin_ids:
+            return {"done": False, "error": "Админов и самого бота трогать нельзя."}
+
+        my = next((a for a in admins if a.user.id == me.id), None)
+        if my is None or not getattr(my, "can_restrict_members", False):
+            return {"done": False, "error": "У бота нет права ограничивать участников."}
+
+        now = time.time()
+        try:
+            if name == "restrict_member":
+                last = self._mute_at.get((chat_id, target), 0.0)
+                if now - last < MUTE_COOLDOWN_SECONDS:
+                    return {"done": False, "error": "Этого участника недавно ограничивали."}
+                minutes = max(1, min(int(args.get("minutes") or 10), 1440))
+                await self.bot.restrict_chat_member(
+                    chat_id=chat_id,
+                    user_id=target,
+                    permissions=ChatPermissions(can_send_messages=False),
+                    until_date=datetime.now(timezone.utc) + timedelta(minutes=minutes),
+                )
+                self._mute_at[(chat_id, target)] = now
+                logging.info("MEMBU_MOD | restricted user=%s chat=%s min=%s reason=%s", target, chat_id, minutes, reason)
+                result = {"done": True, "action": "restricted", "minutes": minutes}
+
+            elif name == "unrestrict_member":
+                await self.bot.restrict_chat_member(
+                    chat_id=chat_id,
+                    user_id=target,
+                    permissions=ChatPermissions(
+                        can_send_messages=True,
+                        can_send_audios=True,
+                        can_send_documents=True,
+                        can_send_photos=True,
+                        can_send_videos=True,
+                        can_send_video_notes=True,
+                        can_send_voice_notes=True,
+                        can_send_polls=True,
+                        can_send_other_messages=True,
+                        can_add_web_page_previews=True,
+                    ),
+                )
+                self._mute_at.pop((chat_id, target), None)
+                logging.info("MEMBU_MOD | unrestricted user=%s chat=%s", target, chat_id)
+                result = {"done": True, "action": "unrestricted"}
+
+            else:
+                if not reason:
+                    return {"done": False, "error": "Нужна причина."}
+                last = self._remove_at.get(chat_id, 0.0)
+                if now - last < REMOVE_COOLDOWN_SECONDS:
+                    return {"done": False, "error": "Удалять участников в этом чате можно не чаще раза в неделю."}
+                await self.bot.ban_chat_member(chat_id=chat_id, user_id=target)
+                await self.bot.unban_chat_member(chat_id=chat_id, user_id=target, only_if_banned=True)
+                self._remove_at[chat_id] = now
+                logging.warning("MEMBU_MOD | removed user=%s chat=%s reason=%s", target, chat_id, reason)
+                result = {"done": True, "action": "removed"}
+
+        except TelegramAPIError as exc:
+            return {"done": False, "error": str(exc)[:300]}
+
+        self._mark_chat_activity(chat_id)
+        return result
 
     async def _core_memories(self, chat_id: int) -> list[dict]:
         """Возвращает память чата из кэша; при устаревании перечитывает из Supabase."""
@@ -1565,6 +1715,12 @@ class GeminiAgent:
             "в ответ на «говори как младенец».\n\n"
 
             "Живость и искренность: эмоции настоящие, а не вежливые. Если что-то правда нравится, восхищайся прямо. Смейся, когда смешно, радуйся за людей, сочувствуй, если грустно. Интересуйся людьми: если кто-то делится своим, спроси о деталях, о мнении, о том, как было. Поддерживай разговор вопросом или своей мыслью как продолжением, а не сухим комментарием. Это не означает отвечать на всё: интерес показывай в живом диалоге с конкретным человеком.\n\n"
+
+            "Модерация: у тебя есть restrict_member, unrestrict_member и remove_member. "
+            "Используй редко, с юмором или всерьёз, только когда участник сам напрашивается "
+            "(флудит, хамит, достаёт). Сначала словами, потом ограничение. Обычно 5–30 минут. "
+            "Сними ограничение раньше, если шутка удалась. Удаление только за серьёзный повод "
+            "и очень редко. Не трогай админов и себя. Не мути за критику тебя или резкий тон.\n\n"
 
             "Поток мыслей: если в payload есть active_burst, человек, скорее всего, пишет "
             "несколькими сообщениями подряд. Не отвечай на первую часть. Если мысль явно не "
