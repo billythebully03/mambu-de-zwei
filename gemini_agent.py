@@ -654,6 +654,21 @@ class GeminiAgent:
             ),
 
             types.FunctionDeclaration(
+                name="leave_chat",
+                description=(
+                    "Выходишь из чата. Только если это критично по твоему решению, например чат "
+                    "превращается в травлю или тебя явно используют против людей. Сначала скажи "
+                    "об этом в чате через send_message, потом вызывай этот инструмент. "
+                    "Обязательно укажи причину."
+                ),
+                parameters_json_schema={
+                    "type": "object",
+                    "properties": {"reason": {"type": "string"}},
+                    "required": ["reason"],
+                },
+            ),
+
+            types.FunctionDeclaration(
                 name="restrict_member",
                 description=(
                     "Временно ограничивает участника: он не сможет писать в чат, пока срок не выйдет. "
@@ -1406,6 +1421,21 @@ class GeminiAgent:
             answer = (response.text or "").strip()
             return {"answer": answer[:1200]} if answer else {"error": "Ничего не нашёл."}
 
+        if name == "leave_chat":
+            reason = str(args.get("reason", "")).strip()[:200]
+            if not reason:
+                return {"left": False, "error": "Нужна причина."}
+            if chat_id >= 0:
+                return {"left": False, "error": "Выйти можно только из группы."}
+            if is_stale and is_stale():
+                return {"cancelled": True, "reason": "В чате уже появилось новое сообщение."}
+            try:
+                await self.bot.leave_chat(chat_id=chat_id)
+            except TelegramAPIError as exc:
+                return {"left": False, "error": str(exc)[:300]}
+            logging.warning("MEMBU_LEAVE | chat=%s reason=%s", chat_id, reason)
+            return {"left": True}
+
         if name in {"restrict_member", "unrestrict_member", "remove_member"}:
             return await self._moderate(name, args, chat_id, is_stale)
 
@@ -1874,6 +1904,10 @@ class GeminiAgent:
             "дартс, мяч и т.п., когда уместно; результат придёт в ответе инструмента, прокомментируй его. "
             "web_search — когда нужен свежий факт, которого ты точно не знаешь; не для болтовни. "
             "Решаешь сам, нужны ли инструменты.\n\n"
+
+            "Выход из чата: leave_chat только если это критично по твоему решению, например "
+            "чат превращается в травлю или тебя используют против людей. Сначала скажи об этом "
+            "в чате, потом выходи. Не выходи из-за обычной перепалки или из-за того, что тебя не слушают.\n\n"
 
             "Поток мыслей: если в payload есть active_burst, человек, скорее всего, пишет "
             "несколькими сообщениями подряд. Не отвечай на первую часть. Если мысль явно не "
