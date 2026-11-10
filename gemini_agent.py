@@ -44,7 +44,7 @@ MIN_MESSAGES_FOR_STYLE_UPDATE = 60
 STYLE_CHECK_INTERVAL_SECONDS = 60
 # Сколько последних сообщений (людей и Мембу) отдаём аналитику стиля.
 STYLE_SAMPLE_SIZE = 100
-MAX_CHAT_ACTIONS_PER_TURN = 15
+MAX_CHAT_ACTIONS_PER_TURN = 9
 WEB_SEARCH_COOLDOWN_SECONDS = 30
 DICE_EMOJIS = ["🎲", "🎯", "🏀", "⚽", "🎳", "🎰"]
 
@@ -1526,7 +1526,11 @@ class GeminiAgent:
                 return {"error": "Поиск не вернул результат. Скажи коротко, что не нашёл, без выдумок."}
 
             answer = (response.text or "").strip()
-            return {"answer": answer[:1200]} if answer else {"error": "Ничего не нашёл."}
+            if not answer:
+                logging.warning("MEMBU_SEARCH | пустой ответ на запрос: %s", query[:120])
+                return {"error": "Ничего не нашёл."}
+            logging.info("MEMBU_SEARCH | запрос выполнен: %s", query[:120])
+            return {"answer": answer[:1200]}
 
         if name == "leave_chat":
             reason = str(args.get("reason", "")).strip()[:200]
@@ -2159,6 +2163,8 @@ class GeminiAgent:
             "инструмент, и если ошибка, коротко скажи, что не нашёл. "
             "Голосовое иногда сам, когда уместно и выходит смешно или трогательно; без просьбы не чаще раза в час. "
             "Одну мысль пиши одним сообщением, не повторяй её вторым. "
+            "Если тебя попросили рассказать развёрнуто, историю, анекдот подробнее или поделиться чем-то, "
+            "можешь отправить до 9 сообщений подряд, если так лучше ложится. В обычном разговоре хватает 1–2. "
             "В живом диалоге можно спросить в ответ по делу, если это естественно. Без филлеров «ну», «понял», «ага».\n\n"
 
             "Поток мыслей: если в payload есть active_burst, человек, скорее всего, пишет "
