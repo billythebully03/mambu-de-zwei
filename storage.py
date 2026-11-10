@@ -187,6 +187,26 @@ class MembuStorage:
             on_conflict="chat_id,category,content",
         ).execute()
 
+    def is_style_frozen(self, chat_id: int) -> bool:
+        try:
+            result = (
+                self.client.table("membu_chat_profiles")
+                .select("style_frozen")
+                .eq("chat_id", chat_id)
+                .limit(1)
+                .execute()
+            )
+        except Exception:
+            return False
+        rows = result.data or []
+        return bool(rows and rows[0].get("style_frozen"))
+
+    def set_style_frozen(self, chat_id: int, frozen: bool) -> None:
+        self.client.table("membu_chat_profiles").upsert(
+            {"chat_id": chat_id, "style_frozen": frozen},
+            on_conflict="chat_id",
+        ).execute()
+
     def get_chat_style(self, chat_id: int) -> dict:
         result = (
             self.client.table("membu_chat_profiles")

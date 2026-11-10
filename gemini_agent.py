@@ -45,8 +45,25 @@ STYLE_CHECK_INTERVAL_SECONDS = 60
 # Сколько последних сообщений (людей и Мембу) отдаём аналитику стиля.
 STYLE_SAMPLE_SIZE = 100
 MAX_CHAT_ACTIONS_PER_TURN = 15
-WEB_SEARCH_COOLDOWN_SECONDS = 120
+WEB_SEARCH_COOLDOWN_SECONDS = 30
 DICE_EMOJIS = ["🎲", "🎯", "🏀", "⚽", "🎳", "🎰"]
+
+
+def dice_meaning(emoji: str, value: int | None) -> str:
+    """Что означает значение анимации Telegram, чтобы модель говорила по делу."""
+    if value is None:
+        return "результат неизвестен"
+    if emoji == "🎯":
+        return "в яблочко" if value == 6 else "мимо яблочка"
+    if emoji == "🏀":
+        return "попал в кольцо" if value in (4, 5) else "промах"
+    if emoji == "⚽":
+        return "гол" if value in (3, 4, 5) else "мимо ворот"
+    if emoji == "🎳":
+        return "страйк" if value == 6 else "не страйк"
+    if emoji == "🎰":
+        return "джекпот" if value == 64 else "не джекпот"
+    return f"выпало {value}"
 PRIMARY_RETRY_SECONDS = 1800
 
 
@@ -110,7 +127,7 @@ DIGEST_INSTRUCTION = (
     "долговечных фактов, которые стоит запомнить: о чём договорились, какие темы "
     "обсуждали и чем закончили, предпочтения людей, устойчивые мнения, незавершённые "
     "дела. Шутки и повторяющиеся темы не сохраняй: это не факты, и память заставит "
-    "возвращаться к ним. Категорию inside_joke не используй. Важность темы не выше 3. "
+    "возвращаться к ним. Категорию inside_joke не используй. Важность темы не выше 3. Одно упоминание темы — не факт: не записывай интерес, предпочтение или мнение, если тема прозвучала один раз; записывай только повторявшееся или прямо названное участником. "
     "Не пересказывай каждую реплику и не записывай "
     "случайное. Не сохраняй пароли, документы, здоровье, личные секреты и "
     "чувствительные сведения. Верни ТОЛЬКО JSON-массив без пояснений. Каждый элемент: "
@@ -384,6 +401,8 @@ class GeminiAgent:
         self._digest_checked_at: dict[int, float] = {}
         self._digest_running: set[int] = set()
         self._search_at: dict[int, float] = {}
+        self._last_sent: dict[int, tuple[str, float]] = {}
+        self._photos: dict[tuple[int, int], str] = {}
         self._polls: dict[str, dict] = {}
 
         base_dir = Path(__file__).resolve().parent
@@ -667,6 +686,56 @@ class GeminiAgent:
                     "type": "object",
                     "properties": {"reason": {"type": "string"}},
                     "required": ["reason"],
+                },
+            ),
+
+            types.FunctionDeclaration(
+                name="edit_permissions",
+                description=(
+                    "Меняет права участника. Для обычного участника — что ему можно писать и отправлять "
+                    "(can_send_messages, can_send_photos, can_send_videos, can_send_polls, "
+                    "can_add_web_page_previews, can_send_other_messages). Для админа — админские права "
+                    "(can_manage_chat, can_delete_messages, can_restrict_members, can_pin_messages, "
+                    "can_invite_users, can_change_info, can_promote_members, can_manage_video_chats, "
+                    "can_manage_topics). Передавай только то, что меняешь. Создателя, владельцев и себя не трогай."
+                ),
+                parameters_json_schema={
+                    "type": "object",
+                    "properties": {
+                        "user_id": {"type": "integer"},
+                        "can_send_messages": {"type": "boolean"},
+                        "can_send_photos": {"type": "boolean"},
+                        "can_send_videos": {"type": "boolean"},
+                        "can_send_polls": {"type": "boolean"},
+                        "can_add_web_page_previews": {"type": "boolean"},
+                        "can_send_other_messages": {"type": "boolean"},
+                        "can_manage_chat": {"type": "boolean"},
+                        "can_delete_messages": {"type": "boolean"},
+                        "can_restrict_members": {"type": "boolean"},
+                        "can_pin_messages": {"type": "boolean"},
+                        "can_invite_users": {"type": "boolean"},
+                        "can_change_info": {"type": "boolean"},
+                        "can_promote_members": {"type": "boolean"},
+                        "can_manage_video_chats": {"type": "boolean"},
+                        "can_manage_topics": {"type": "boolean"},
+                    },
+                    "required": ["user_id"],
+                },
+            ),
+
+            types.FunctionDeclaration(
+                name="look_at_image",
+                description=(
+                    "Смотрит фото из чата по message_id (он есть в истории как [фото]). Используй только "
+                    "когда картинка нужна для ответа, не для всех подряд. question — что именно разглядеть."
+                ),
+                parameters_json_schema={
+                    "type": "object",
+                    "properties": {
+                        "message_id": {"type": "integer"},
+                        "question": {"type": "string"},
+                    },
+                    "required": ["message_id"],
                 },
             ),
 
@@ -1161,6 +1230,12 @@ class GeminiAgent:
             text = text[:4000]
             reply_to = self._parse_reply_to(args)
 
+            norm = re.sub(r"\W+", " ", text.lower()).strip()
+            last = self._last_sent.get(chat_id)
+            if last and last[0] == norm and time.time() - last[1] < 600:
+                return {"sent": False, "error": "Ты уже написал это же. Не повторяйся; если добавить нечего, молчи."}
+            self._last_sent[chat_id] = (norm, time.time())
+
             try:
                 sent = await self.bot.send_message(
                     chat_id=chat_id,
@@ -1412,11 +1487,12 @@ class GeminiAgent:
                 return {"sent": False, "error": str(exc)[:300]}
 
             value = sent.dice.value if sent.dice else None
+            meaning = dice_meaning(emoji, value)
             await self._store_bot_message(
-                chat_id, sent, f"[игра {emoji}: {value}]", branch_id, None,
+                chat_id, sent, f"[игра {emoji}: {value}, {meaning}]", branch_id, None,
             )
             self._mark_chat_activity(chat_id)
-            return {"sent": True, "emoji": emoji, "value": value}
+            return {"sent": True, "emoji": emoji, "value": value, "meaning": meaning}
 
         if name == "web_search":
             query = str(args.get("query", "")).strip()[:300]
@@ -1446,8 +1522,8 @@ class GeminiAgent:
                 )
             except Exception as exc:
                 self.note_api_error(exc)
-                logging.exception("Ошибка веб-поиска")
-                return {"error": "Поиск сейчас недоступен."}
+                logging.exception("MEMBU_SEARCH | ошибка веб-поиска")
+                return {"error": "Поиск не вернул результат. Скажи коротко, что не нашёл, без выдумок."}
 
             answer = (response.text or "").strip()
             return {"answer": answer[:1200]} if answer else {"error": "Ничего не нашёл."}
@@ -1467,10 +1543,124 @@ class GeminiAgent:
             logging.warning("MEMBU_LEAVE | chat=%s reason=%s", chat_id, reason)
             return {"left": True}
 
+        if name == "edit_permissions":
+            return await self._edit_permissions(args, chat_id)
+
+        if name == "look_at_image":
+            return await self._look_at_image(args, chat_id)
+
         if name in {"restrict_member", "unrestrict_member", "remove_member"}:
             return await self._moderate(name, args, chat_id, is_stale)
 
         return {"error": "Неизвестный инструмент."}
+
+    def remember_photo(self, chat_id: int, message_id: int, file_id: str) -> None:
+        """Запоминает file_id фото, чтобы модель могла посмотреть его по message_id."""
+        self._photos[(chat_id, message_id)] = file_id
+        if len(self._photos) > 300:
+            for key in list(self._photos)[: len(self._photos) - 300]:
+                self._photos.pop(key, None)
+
+    async def _look_at_image(self, args: dict, chat_id: int) -> dict:
+        try:
+            message_id = int(args.get("message_id"))
+        except (TypeError, ValueError):
+            return {"error": "Нужен message_id фото."}
+
+        file_id = self._photos.get((chat_id, message_id))
+        if not file_id:
+            return {"error": "Фото не найдено: оно старое или это не фото."}
+
+        question = str(args.get("question") or "Коротко опиши, что на картинке, без пафоса.").strip()[:300]
+        try:
+            file = await self.bot.get_file(file_id)
+            buffer = await self.bot.download_file(file.file_path)
+            data = buffer.read()
+            response = await asyncio.to_thread(
+                self._generate,
+                model=self.model,
+                contents=[
+                    types.Part.from_bytes(data=data, mime_type="image/jpeg"),
+                    question,
+                ],
+                config=types.GenerateContentConfig(temperature=0.3, max_output_tokens=400),
+            )
+        except TelegramAPIError as exc:
+            return {"error": str(exc)[:300]}
+        except Exception as exc:
+            self.note_api_error(exc)
+            logging.exception("MEMBU_IMAGE | не удалось посмотреть фото")
+            return {"error": "Не получилось посмотреть фото."}
+
+        description = (response.text or "").strip()
+        return {"description": description[:800]} if description else {"error": "Ничего не разглядел."}
+
+    async def _edit_permissions(self, args: dict, chat_id: int) -> dict:
+        try:
+            target = int(args.get("user_id"))
+        except (TypeError, ValueError):
+            return {"done": False, "error": "Некорректный user_id."}
+
+        try:
+            admins = await self.bot.get_chat_administrators(chat_id)
+            me = await self.bot.get_me()
+        except TelegramAPIError as exc:
+            return {"done": False, "error": str(exc)[:300]}
+
+        if target == me.id:
+            return {"done": False, "error": "Себе права не меняю."}
+
+        owners = {
+            u.strip().lower()
+            for u in os.getenv("MEMBU_OWNER_USERNAMES", "ibartyom,Ribapibaa").split(",")
+            if u.strip()
+        }
+        member = next((a for a in admins if a.user.id == target), None)
+        if member is not None:
+            if member.status == "creator":
+                return {"done": False, "error": "Создателя не трогаю."}
+            if (member.user.username or "").lower() in owners:
+                return {"done": False, "error": "Владельцев не трогаю."}
+
+        my = next((a for a in admins if a.user.id == me.id), None)
+        if my is None or not getattr(my, "can_promote_members", False) and not getattr(my, "can_restrict_members", False):
+            return {"done": False, "error": "У бота нет прав менять права участников."}
+
+        restrict_keys = [
+            "can_send_messages", "can_send_photos", "can_send_videos", "can_send_polls",
+            "can_add_web_page_previews", "can_send_other_messages",
+        ]
+        admin_keys = [
+            "can_manage_chat", "can_delete_messages", "can_restrict_members", "can_pin_messages",
+            "can_invite_users", "can_change_info", "can_promote_members",
+            "can_manage_video_chats", "can_manage_topics",
+        ]
+        requested = {
+            k: bool(args[k]) for k in restrict_keys + admin_keys if k in args
+        }
+        if not requested:
+            return {"done": False, "error": "Не указано, какие права менять."}
+
+        try:
+            if member is not None and member.status == "administrator":
+                current = {k: bool(getattr(member, k, False)) for k in admin_keys}
+                current.update({k: v for k, v in requested.items() if k in admin_keys})
+                await self.bot.promote_chat_member(chat_id=chat_id, user_id=target, **current)
+                kind = "admin"
+            else:
+                perms = {k: requested.get(k, True) for k in restrict_keys}
+                await self.bot.restrict_chat_member(
+                    chat_id=chat_id,
+                    user_id=target,
+                    permissions=ChatPermissions(**perms),
+                )
+                kind = "member"
+        except TelegramAPIError as exc:
+            return {"done": False, "error": str(exc)[:300]}
+
+        logging.warning("MEMBU_PERMS | chat=%s user=%s kind=%s changed=%s", chat_id, target, kind, requested)
+        self._mark_chat_activity(chat_id)
+        return {"done": True, "kind": kind, "changed": requested}
 
     async def _moderate(
         self,
@@ -1681,6 +1871,10 @@ class GeminiAgent:
         решит ли основной ответ что-то обновить.
         """
         if chat_id in self._style_running:
+            return
+
+        if await asyncio.to_thread(self.storage.is_style_frozen, chat_id):
+            logging.info("MEMBU_STYLE | chat=%s frozen, skip", chat_id)
             return
 
         self._style_running.add(chat_id)
@@ -1956,6 +2150,16 @@ class GeminiAgent:
             "Выход из чата: leave_chat только если это критично по твоему решению, например "
             "чат превращается в травлю или тебя используют против людей. Сначала скажи об этом "
             "в чате, потом выходи. Не выходи из-за обычной перепалки или из-за того, что тебя не слушают.\n\n"
+
+            "Права и фото: edit_permissions меняет права участника (обычного или админа), "
+            "только по ситуации и только то, что нужно. Создателя, владельцев и себя не трогай. "
+            "look_at_image смотрит фото из чата по message_id, только когда картинка нужна для ответа. "
+            "Кубик и игры: отвечай по полю meaning из результата, попал или нет, страйк или нет. "
+            "web_search: используй, когда нужен факт; не объявляй поиск недоступным заранее, вызови "
+            "инструмент, и если ошибка, коротко скажи, что не нашёл. "
+            "Голосовое иногда сам, когда уместно и выходит смешно или трогательно; без просьбы не чаще раза в час. "
+            "Одну мысль пиши одним сообщением, не повторяй её вторым. "
+            "В живом диалоге можно спросить в ответ по делу, если это естественно. Без филлеров «ну», «понял», «ага».\n\n"
 
             "Поток мыслей: если в payload есть active_burst, человек, скорее всего, пишет "
             "несколькими сообщениями подряд. Не отвечай на первую часть. Если мысль явно не "

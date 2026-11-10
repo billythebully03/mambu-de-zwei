@@ -986,6 +986,7 @@ async def style_list_view() -> tuple[str, InlineKeyboardMarkup]:
 
 async def style_chat_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
     row = await asyncio.to_thread(storage.get_chat_style, chat_id)
+    frozen = await asyncio.to_thread(storage.is_style_frozen, chat_id)
 
     updated = parse_db_time(row.get("updated_at"))
     updated_text = format_dubai(updated) if updated else "—"
@@ -994,17 +995,45 @@ async def style_chat_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
     text = (
         f"Модель общения, чат {chat_id}\n"
         f"Сообщений учтено: {row.get('observed_messages') or 0}\n"
-        f"Обновлено: {updated_text} (Дубай)\n\n"
+        f"Обновлено: {updated_text} (Дубай)\n"
+        f"Заморозка: {'да, автообновления выключены' if frozen else 'нет'}\n\n"
         f"{profile[:3500]}"
     )
 
     markup = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Обновить сейчас", callback_data=f"sty:refresh:{chat_id}")],
+            [
+                InlineKeyboardButton(
+                    text="🔥 Разморозить" if frozen else "❄️ Заморозить",
+                    callback_data=f"stf:{'off' if frozen else 'on'}:{chat_id}",
+                )
+            ],
             [InlineKeyboardButton(text="Назад", callback_data="sty:list")],
         ]
     )
     return text, markup
+
+
+@router.callback_query(F.data.startswith("stf:"))
+async def handle_style_freeze(callback: CallbackQuery) -> None:
+    message = callback.message
+    if message is None or storage is None or not is_owner_dm(callback.from_user, message.chat.type):
+        await callback.answer()
+        return
+
+    _, action, raw_chat = callback.data.split(":", 2)
+    chat_id = int(raw_chat)
+    try:
+        await asyncio.to_thread(storage.set_style_frozen, chat_id, action == "on")
+    except Exception:
+        logging.exception("MEMBU_STYLE | не удалось переключить заморозку")
+        await callback.answer("Не получилось. Проверь SQL-миграцию style_frozen.", show_alert=True)
+        return
+
+    text, markup = await style_chat_view(chat_id)
+    await message.edit_text(text, reply_markup=markup)
+    await callback.answer("Заморожено" if action == "on" else "Разморожено")
 
 
 @router.message(Command("style"))
@@ -1511,6 +1540,8 @@ async def handle_message(message: Message) -> None:
         return
 
     chat_id = message.chat.id
+    if message.photo and agent is not None:
+        agent.remember_photo(chat_id, message.message_id, message.photo[-1].file_id)
     if message.chat.type in {"group", "supergroup"}:
         # Считаем активностью и фото/стикеры/голосовые, даже если их
         # текстовая подпись пуста и текущая AI-логика их не анализирует.
