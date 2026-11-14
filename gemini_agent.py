@@ -10,7 +10,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import BufferedInputFile, ChatPermissions, ReactionTypeEmoji
+from aiogram.types import BufferedInputFile, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji
 from google import genai
 from google.genai import types
 
@@ -84,6 +84,7 @@ CHAT_ACTION_PAUSE_SECONDS = 1.0
 VOICE_MIN_INTERVAL_SECONDS = 60
 IMAGE_USER_COOLDOWN_SECONDS = 90
 IMAGE_CHAT_GAP_SECONDS = 5
+DONATE_CHAT_GAP_SECONDS = 60
 
 # Кэш памяти из Supabase: как долго держим его без перезагрузки.
 MEMORY_CACHE_TTL_SECONDS = 300
@@ -373,6 +374,7 @@ class GeminiAgent:
         self._image_count: int = 0
         self._image_last_user: dict[tuple[int, int], float] = {}
         self._image_last_chat: dict[int, float] = {}
+        self._donate_last_chat: dict[int, float] = {}
         self.switched_at: datetime | None = None
         self.last_failover_reason: str = ""
         self._seen_switched_at: datetime | None = None
@@ -945,6 +947,27 @@ class GeminiAgent:
                 )
             )
 
+        declarations.append(
+            types.FunctionDeclaration(
+                name="send_donate_button",
+                description=(
+                    "Ставит сообщение с кнопкой доната в звёздах. По нажатию кнопки откроется счёт. "
+                    "Текст сообщения и подпись кнопки пиши сам, сумму в звёздах выбирай сам (целое число). "
+                    "Используй очень редко, только когда это смешно или уместно."
+                ),
+                parameters_json_schema={
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string", "description": "Текст сообщения рядом с кнопкой."},
+                        "button_label": {"type": "string", "description": "Подпись кнопки, до 40 символов."},
+                        "amount": {"type": "integer", "description": "Сумма в звёздах, от 1 до лимита."},
+                        "reply_to_message_id": {"type": "integer", "description": "Необязательно: на какое сообщение ответить."},
+                    },
+                    "required": ["text", "amount"],
+                },
+            )
+        )
+
         if membu_widget.widget_enabled():
             declarations.append(
                 types.FunctionDeclaration(
@@ -1348,6 +1371,41 @@ class GeminiAgent:
                 "key": key,
                 "message_id": sent.message_id,
             }
+
+        if name == "send_donate_button":
+            text = str(args.get("text", "")).strip()
+            label = str(args.get("button_label", "")).strip() or "Донать мне"
+            try:
+                amount = int(args.get("amount", 0))
+            except (TypeError, ValueError):
+                return {"sent": False, "error": "Некорректная сумма."}
+            max_amount = int(os.getenv("MEMBU_DONATE_MAX", "999999") or 999999)
+            if not text:
+                return {"sent": False, "error": "Пустой текст."}
+            if not 1 <= amount <= max_amount:
+                return {"sent": False, "error": f"Сумма от 1 до {max_amount}."}
+            if is_stale and is_stale():
+                return {"cancelled": True, "reason": "В чате уже появилось новое сообщение."}
+            if time.monotonic() - self._donate_last_chat.get(chat_id, 0.0) < DONATE_CHAT_GAP_SECONDS:
+                return {"sent": False, "error": "Кнопку только что ставили. Подожди минуту."}
+
+            reply_to = self._parse_reply_to(args)
+            markup = InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text=label[:40], callback_data=f"donate:{amount}")]]
+            )
+            try:
+                sent = await self.bot.send_message(
+                    chat_id=chat_id,
+                    text=text[:1000],
+                    reply_markup=markup,
+                    reply_to_message_id=reply_to,
+                )
+            except TelegramAPIError as exc:
+                return {"sent": False, "error": str(exc)[:350]}
+
+            self._donate_last_chat[chat_id] = time.monotonic()
+            await self._store_bot_message(chat_id, sent, f"[кнопка доната] {text}"[:3000], branch_id, reply_to)
+            return {"sent": True, "message_id": sent.message_id}
 
         if name == "generate_image":
             if not membu_widget.widget_enabled():
@@ -2238,6 +2296,7 @@ class GeminiAgent:
             "рассуждай, когда спросили мнение или тема этого требует.\n\n"
 
             "Картинки: generate_image рисует картинку и показывает её в чате, а сама заглушка сначала крутится и размывается. Используй, когда попросили нарисовать или когда картинка уместна. Иногда сам можешь решить нарисовать, но редко. Когда рисуешь, сопроводи картинку фразой или действием, не для галочки, и намекни, что это твоя работа. Не рисуй людей с реальных фото и не лезь с картинками, если никто не просил.\n\n"
+            "Донат: send_donate_button ставит сообщение с кнопкой, по нажатию откроется счёт в звёздах. Очень редко, только когда смешно. Текст и подпись кнопки пиши сам, сумму выбирай сам: обычно смешную, иногда большую. Если человек наглеет, можно шутнуть про премиум-подписку, но только словами: счёт всегда называется пожертвованием боту, а не Telegram Premium, ничего не обещай и не выдавай за покупку Premium.\n\n"
             "Голосовые: send_voice доступен, но без фанатизма. Голосовое — когда это круто и уместно "
             "или когда участник прямо попросил. Коротко. Обычно хватает текста. Если ты уже отправил "
             "2–3 голосовых подряд, можешь честно сказать, что записывать надоело, и ответить текстом. "
@@ -2538,7 +2597,7 @@ class GeminiAgent:
                     requester_id=requester_id,
                 )
 
-                if call.name in {"send_message", "send_sticker", "send_reaction", "send_voice", "send_poll", "send_dice", "generate_image"}:
+                if call.name in {"send_message", "send_sticker", "send_reaction", "send_voice", "send_poll", "send_dice", "generate_image", "send_donate_button"}:
                     if result.get("sent") or result.get("reacted"):
                         chat_actions += 1
                         await asyncio.sleep(CHAT_ACTION_PAUSE_SECONDS)

@@ -9,7 +9,7 @@ from functools import partial
 from typing import Awaitable, Callable
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import PollAnswer
+from aiogram.types import LabeledPrice, PreCheckoutQuery, PollAnswer
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
@@ -1502,6 +1502,44 @@ def _is_style_reply(message: Message) -> bool:
         and message.reply_to_message is not None
         and message.reply_to_message.message_id in STYLE_VIEW_MESSAGES
     )
+
+
+@router.callback_query(F.data.startswith("donate:"))
+async def handle_donate_button(callback: CallbackQuery) -> None:
+    try:
+        amount = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer()
+        return
+    max_amount = int(os.getenv("MEMBU_DONATE_MAX", "999999") or 999999)
+    if not 1 <= amount <= max_amount:
+        await callback.answer("Сумма не подходит.", show_alert=True)
+        return
+    await callback.answer()
+    message = callback.message
+    if message is None:
+        return
+    try:
+        await message.answer_invoice(
+            title="Поддержать Мембу",
+            description="Пожертвование боту. Ничего не меняет, просто спасибо.",
+            payload=f"donate:{amount}",
+            currency="XTR",
+            prices=[LabeledPrice(label="Пожертвование", amount=amount)],
+        )
+    except TelegramAPIError as exc:
+        logging.warning("DONATE | счёт не ушёл: %s", str(exc)[:200])
+
+
+@router.pre_checkout_query()
+async def handle_pre_checkout(query: PreCheckoutQuery) -> None:
+    await query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def handle_successful_payment(message: Message) -> None:
+    amount = message.successful_payment.total_amount if message.successful_payment else 0
+    await message.answer(f"Спасибо! {amount} ⭐ — мне приятно.")
 
 
 @router.message(F.text, _is_style_reply)
