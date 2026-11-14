@@ -82,6 +82,8 @@ def _should_failover(exc: Exception) -> bool:
     )
 CHAT_ACTION_PAUSE_SECONDS = 1.0
 VOICE_MIN_INTERVAL_SECONDS = 60
+IMAGE_USER_COOLDOWN_SECONDS = 90
+IMAGE_CHAT_GAP_SECONDS = 5
 
 # Кэш памяти из Supabase: как долго держим его без перезагрузки.
 MEMORY_CACHE_TTL_SECONDS = 300
@@ -369,6 +371,8 @@ class GeminiAgent:
         self._voice_last_at: dict[int, float] = {}
         self._image_day: str = ""
         self._image_count: int = 0
+        self._image_last_user: dict[tuple[int, int], float] = {}
+        self._image_last_chat: dict[int, float] = {}
         self.switched_at: datetime | None = None
         self.last_failover_reason: str = ""
         self._seen_switched_at: datetime | None = None
@@ -1069,6 +1073,7 @@ class GeminiAgent:
         chat_id: int,
         branch_id: str | None,
         is_stale: Callable[[], bool] | None = None,
+        requester_id: int | None = None,
     ) -> dict:
         args = args or {}
 
@@ -1352,6 +1357,16 @@ class GeminiAgent:
             if not prompt:
                 return {"sent": False, "error": "Пустой промпт."}
 
+            now = time.monotonic()
+            user_key = (chat_id, requester_id or 0)
+            if now - self._image_last_user.get(user_key, 0.0) < IMAGE_USER_COOLDOWN_SECONDS:
+                return {
+                    "sent": False,
+                    "error": "Этот участник уже недавно просил картинку. Подожди полторы минуты.",
+                }
+            if now - self._image_last_chat.get(chat_id, 0.0) < IMAGE_CHAT_GAP_SECONDS:
+                return {"sent": False, "error": "Картинка только что была. Подожди пару секунд."}
+
             limit = int(os.getenv("MEMBU_IMAGE_DAILY_LIMIT", "35") or 35)
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             if self._image_day != today:
@@ -1393,7 +1408,11 @@ class GeminiAgent:
 
             if widget_id:
                 await membu_widget.finish_widget(chat_id, widget_id)
+                membu_widget.delete_widget_later(chat_id, widget_id)
             self._image_count += 1
+            done_at = time.monotonic()
+            self._image_last_user[user_key] = done_at
+            self._image_last_chat[chat_id] = done_at
 
             await self._store_bot_message(
                 chat_id,
@@ -2143,6 +2162,12 @@ class GeminiAgent:
         core_memories = await self._core_memories(chat_id)
         chat_style = await self._chat_style(chat_id)
 
+        requester_id: int | None = None
+        for m in reversed(recent_messages or []):
+            if m.get("sender_id") and m.get("sender_name") != "Мембу":
+                requester_id = int(m["sender_id"])
+                break
+
         # Профиль стиля пересобирается в фоне, сам ответ не ждёт его.
         self.maybe_refresh_style(chat_id)
         self.maybe_refresh_digest(chat_id)
@@ -2493,6 +2518,7 @@ class GeminiAgent:
                     chat_id=chat_id,
                     branch_id=branch_id,
                     is_stale=is_stale,
+                    requester_id=requester_id,
                 )
 
                 if call.name in {"send_message", "send_sticker", "send_reaction", "send_voice", "send_poll", "send_dice", "generate_image"}:

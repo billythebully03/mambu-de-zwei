@@ -5,6 +5,7 @@
 Без CLOUDFLARE_ACCOUNT_ID и CLOUDFLARE_API_TOKEN инструмент не объявляется модели.
 """
 
+import asyncio
 import base64
 import logging
 import os
@@ -95,6 +96,21 @@ async def finish_widget(chat_id: int, message_id: int) -> None:
         "editMessageWidgetData",
         {"chat_id": chat_id, "message_id": message_id, "chat_data": '{"s":"done"}'},
     )
+
+
+_PENDING_DELETES: set[asyncio.Task] = set()
+
+
+async def _delete_after(chat_id: int, message_id: int, delay: float) -> None:
+    await asyncio.sleep(delay)
+    await _tg("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+
+
+def delete_widget_later(chat_id: int, message_id: int, delay: float = 2.5) -> None:
+    """Удаляет виджет через пару секунд, когда он уже размылся. Задача держится в наборе, чтобы её не собрал GC."""
+    task = asyncio.create_task(_delete_after(chat_id, message_id, delay))
+    _PENDING_DELETES.add(task)
+    task.add_done_callback(_PENDING_DELETES.discard)
 
 
 async def generate_image(prompt: str) -> bytes | None:
