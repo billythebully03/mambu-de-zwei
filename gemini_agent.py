@@ -1385,7 +1385,8 @@ class GeminiAgent:
             reply_to = self._parse_reply_to(args)
 
             # Сначала виджет. Если Telegram его не принял, картинка уходит обычным фото.
-            widget_id = await membu_widget.send_widget(chat_id, caption or "Мембу рисует")
+            # Виджет отключён: Telegram отвечает NOT_ALLOWED. Картинка уходит фото сразу.
+            widget_id = None
 
             image = await membu_widget.generate_image(prompt)
 
