@@ -30,6 +30,18 @@ services:
       - key: FISH_VOICE_ID
         sync: false
 
+      - key: CLOUDFLARE_ACCOUNT_ID
+        sync: false
+
+      - key: CLOUDFLARE_API_TOKEN
+        sync: false
+
+      - key: CF_IMAGE_MODEL
+        value: "@cf/black-forest-labs/flux-1-schnell"
+
+      - key: MEMBU_IMAGE_DAILY_LIMIT
+        value: "35"
+
       - key: GEMINI_MODEL
         value: gemini-3.5-flash-lite
 

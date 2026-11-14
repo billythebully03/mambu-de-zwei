@@ -15,6 +15,7 @@ from google import genai
 from google.genai import types
 
 import fish_voice
+import membu_widget
 
 
 MEMORY_CATEGORIES = [
@@ -366,6 +367,8 @@ class GeminiAgent:
         self._caches: dict[int, tuple[str, float]] = {}
         self._cache_off_until: dict[int, float] = {}
         self._voice_last_at: dict[int, float] = {}
+        self._image_day: str = ""
+        self._image_count: int = 0
         self.switched_at: datetime | None = None
         self.last_failover_reason: str = ""
         self._seen_switched_at: datetime | None = None
@@ -938,6 +941,38 @@ class GeminiAgent:
                 )
             )
 
+        if membu_widget.widget_enabled():
+            declarations.append(
+                types.FunctionDeclaration(
+                    name="generate_image",
+                    description=(
+                        "Рисует картинку и показывает её в чате с виджетом-заглушкой. Используй, когда "
+                        "участник попросил нарисовать, или когда картинка уместна к разговору. Иногда "
+                        "можешь сам решить нарисовать, но редко, и намекни, что это твоя работа. "
+                        "Промпт пиши по-английски, коротко и конкретно. Подпись к картинке — по-русски, "
+                        "одна живая фраза."
+                    ),
+                    parameters_json_schema={
+                        "type": "object",
+                        "properties": {
+                            "prompt": {
+                                "type": "string",
+                                "description": "Описание картинки на английском.",
+                            },
+                            "caption": {
+                                "type": "string",
+                                "description": "Короткая подпись к картинке на русском.",
+                            },
+                            "reply_to_message_id": {
+                                "type": "integer",
+                                "description": "Необязательный ID сообщения, на которое ответить.",
+                            },
+                        },
+                        "required": ["prompt"],
+                    },
+                )
+            )
+
         if self.stickers:
             sticker_keys = list(self.stickers.keys())
 
@@ -1308,6 +1343,65 @@ class GeminiAgent:
                 "key": key,
                 "message_id": sent.message_id,
             }
+
+        if name == "generate_image":
+            if not membu_widget.widget_enabled():
+                return {"sent": False, "error": "Рисование не настроено."}
+
+            prompt = str(args.get("prompt", "")).strip()
+            if not prompt:
+                return {"sent": False, "error": "Пустой промпт."}
+
+            limit = int(os.getenv("MEMBU_IMAGE_DAILY_LIMIT", "35") or 35)
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if self._image_day != today:
+                self._image_day = today
+                self._image_count = 0
+            if self._image_count >= limit:
+                return {"sent": False, "error": "Картинки на сегодня кончились. Скажи об этом текстом."}
+
+            if is_stale and is_stale():
+                return {
+                    "cancelled": True,
+                    "reason": "В чате уже появилось новое сообщение.",
+                }
+
+            caption = str(args.get("caption", "")).strip()
+            reply_to = self._parse_reply_to(args)
+
+            widget_id = await membu_widget.send_widget(chat_id, caption or "Мембу рисует")
+            if not widget_id:
+                return {"sent": False, "error": "Виджет не отправился."}
+
+            image = await membu_widget.generate_image(prompt)
+
+            if not image:
+                await membu_widget.finish_widget(chat_id, widget_id)
+                return {"sent": False, "error": "Не получилось нарисовать. Скажи честно, что не вышло."}
+
+            try:
+                sent = await self.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=BufferedInputFile(image, filename="membu.png"),
+                    caption=caption[:1000] or None,
+                    reply_to_message_id=reply_to,
+                )
+            except TelegramAPIError as exc:
+                await membu_widget.finish_widget(chat_id, widget_id)
+                return {"sent": False, "error": str(exc)[:350]}
+
+            await membu_widget.finish_widget(chat_id, widget_id)
+            self._image_count += 1
+
+            await self._store_bot_message(
+                chat_id,
+                sent,
+                f"[картинка] {caption or prompt}"[:3000],
+                branch_id,
+                reply_to,
+            )
+
+            return {"sent": True, "message_id": sent.message_id}
 
         if name == "send_voice":
             if not fish_voice.voice_enabled():
@@ -2099,6 +2193,7 @@ class GeminiAgent:
             "Вайб: короткая живая реплика часто лучше развёрнутой. Не разворачивай без повода: "
             "рассуждай, когда спросили мнение или тема этого требует.\n\n"
 
+            "Картинки: generate_image рисует картинку и показывает её в чате, а сама заглушка сначала крутится и размывается. Используй, когда попросили нарисовать или когда картинка уместна. Иногда сам можешь решить нарисовать, но редко. Когда рисуешь, сопроводи картинку фразой или действием, не для галочки, и намекни, что это твоя работа. Не рисуй людей с реальных фото и не лезь с картинками, если никто не просил.\n\n"
             "Голосовые: send_voice доступен, но без фанатизма. Голосовое — когда это круто и уместно "
             "или когда участник прямо попросил. Коротко. Обычно хватает текста. Если ты уже отправил "
             "2–3 голосовых подряд, можешь честно сказать, что записывать надоело, и ответить текстом. "
@@ -2398,7 +2493,7 @@ class GeminiAgent:
                     is_stale=is_stale,
                 )
 
-                if call.name in {"send_message", "send_sticker", "send_reaction", "send_voice", "send_poll", "send_dice"}:
+                if call.name in {"send_message", "send_sticker", "send_reaction", "send_voice", "send_poll", "send_dice", "generate_image"}:
                     if result.get("sent") or result.get("reacted"):
                         chat_actions += 1
                         await asyncio.sleep(CHAT_ACTION_PAUSE_SECONDS)
