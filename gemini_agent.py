@@ -1369,14 +1369,14 @@ class GeminiAgent:
             caption = str(args.get("caption", "")).strip()
             reply_to = self._parse_reply_to(args)
 
+            # Сначала виджет. Если Telegram его не принял, картинка уходит обычным фото.
             widget_id = await membu_widget.send_widget(chat_id, caption or "Мембу рисует")
-            if not widget_id:
-                return {"sent": False, "error": "Виджет не отправился."}
 
             image = await membu_widget.generate_image(prompt)
 
             if not image:
-                await membu_widget.finish_widget(chat_id, widget_id)
+                if widget_id:
+                    await membu_widget.finish_widget(chat_id, widget_id)
                 return {"sent": False, "error": "Не получилось нарисовать. Скажи честно, что не вышло."}
 
             try:
@@ -1387,10 +1387,12 @@ class GeminiAgent:
                     reply_to_message_id=reply_to,
                 )
             except TelegramAPIError as exc:
-                await membu_widget.finish_widget(chat_id, widget_id)
+                if widget_id:
+                    await membu_widget.finish_widget(chat_id, widget_id)
                 return {"sent": False, "error": str(exc)[:350]}
 
-            await membu_widget.finish_widget(chat_id, widget_id)
+            if widget_id:
+                await membu_widget.finish_widget(chat_id, widget_id)
             self._image_count += 1
 
             await self._store_bot_message(
