@@ -1385,8 +1385,10 @@ class GeminiAgent:
             reply_to = self._parse_reply_to(args)
 
             # Сначала виджет. Если Telegram его не принял, картинка уходит обычным фото.
-            # Виджет отключён: Telegram отвечает NOT_ALLOWED. Картинка уходит фото сразу.
-            widget_id = None
+            # Виджет только в личке с ботом (в личке chat_id положительный, в группах отрицательный).
+            widget_id = (
+                await membu_widget.send_widget(chat_id, "Мембу рисует") if chat_id > 0 else None
+            )
 
             image = await membu_widget.generate_image(prompt)
 
@@ -1399,13 +1401,19 @@ class GeminiAgent:
                 sent = await self.bot.send_photo(
                     chat_id=chat_id,
                     photo=BufferedInputFile(image, filename="membu.png"),
-                    caption=caption[:1000] or None,
                     reply_to_message_id=reply_to,
                 )
             except TelegramAPIError as exc:
                 if widget_id:
                     await membu_widget.finish_widget(chat_id, widget_id)
                 return {"sent": False, "error": str(exc)[:350]}
+
+            caption_msg = None
+            if caption:
+                try:
+                    caption_msg = await self.bot.send_message(chat_id=chat_id, text=caption[:1000])
+                except TelegramAPIError as exc:
+                    logging.warning("IMAGE | подпись не ушла: %s", str(exc)[:200])
 
             if widget_id:
                 await membu_widget.finish_widget(chat_id, widget_id)
@@ -1418,10 +1426,18 @@ class GeminiAgent:
             await self._store_bot_message(
                 chat_id,
                 sent,
-                f"[картинка] {caption or prompt}"[:3000],
+                f"[картинка] {prompt}"[:3000],
                 branch_id,
                 reply_to,
             )
+            if caption_msg:
+                await self._store_bot_message(
+                    chat_id,
+                    caption_msg,
+                    caption[:3000],
+                    branch_id,
+                    None,
+                )
 
             return {"sent": True, "message_id": sent.message_id}
 
